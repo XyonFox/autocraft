@@ -24,9 +24,10 @@ export function tooOpenSids(sids: string[], allowed: string[]): string[] {
  * The identities the file grants access to, with the current account's SID first and the
  * file's owner second: an owner can rewrite a clean ACL at will (Windows grants it implicit
  * write-DAC), so the owner is validated like any other grantee. PowerShell reads the ACL as
- * objects and translates every grantee to its SID, whatever the account's display name or the
- * installation's language; a grantee or owner whose account no longer resolves comes back as
- * UNRESOLVED. The path travels in AUTOCRAFT_ACL_PATH and never in the script text: PowerShell
+ * objects and translates the identity of every Allow rule to its SID, whatever the account's
+ * display name or the installation's language; a Deny rule names a trustee it excludes, not
+ * one it grants, so only Allow rules name grantees. A grantee or owner whose account no longer
+ * resolves comes back as UNRESOLVED. The path travels in AUTOCRAFT_ACL_PATH and never in the script text: PowerShell
  * 5.1 also treats the curly apostrophes of other scripts as quote delimiters, so a path such
  * as C:\Users\O'Neil\secrets.json must be data, not source, and no filename character can
  * become script syntax.
@@ -36,7 +37,7 @@ export const ACL_SCRIPT =
   "$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;" +
   "$acl=Get-Acl -LiteralPath $env:AUTOCRAFT_ACL_PATH;" +
   "$owner='UNRESOLVED'; try { $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch {};" +
-  "$sids=@($acl.Access | ForEach-Object { try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { 'UNRESOLVED' } } | Sort-Object -Unique);" +
+  "$sids=@($acl.Access | Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { 'UNRESOLVED' } } | Sort-Object -Unique);" +
   "$me; $owner; $sids";
 
 function aclSids(path: string): { me: string; owner: string; sids: string[] } {

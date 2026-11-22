@@ -45,3 +45,7 @@ test("a file owned by another account is refused even when the ACL grants only a
   const otherOwner = "S-1-5-21-444444444-555555555-666666666-1002";
   assert.deepEqual(tooOpenSids([otherOwner, "S-1-5-18", "S-1-5-32-544", me], allowed), [otherOwner]);
 });
+
+test("only Allow rules name grantees: a Deny rule excludes a trustee rather than granting it", () => {
+  assert.ok(ACL_SCRIPT.includes("Where-Object { $_.AccessControlType -eq 'Allow' }"));
+});
