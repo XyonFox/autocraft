@@ -38,3 +38,10 @@ test("the path reaches PowerShell as an environment variable, never as script te
   assert.ok(!ACL_SCRIPT.includes(String.fromCharCode(0x2018)));
   assert.ok(!ACL_SCRIPT.includes(String.fromCharCode(0x2019)));
 });
+
+test("a file owned by another account is refused even when the ACL grants only allowed identities", () => {
+  // The owner travels in the validated collection with the grantees: on Windows an owner can
+  // rewrite a clean ACL (implicit write-DAC), so an owner outside the allowed identities is access.
+  const otherOwner = "S-1-5-21-444444444-555555555-666666666-1002";
+  assert.deepEqual(tooOpenSids([otherOwner, "S-1-5-18", "S-1-5-32-544", me], allowed), [otherOwner]);
+});
