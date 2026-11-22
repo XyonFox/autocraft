@@ -85,7 +85,7 @@ export const restMergeable: RestRead = async (repo, number) => {
   const args = ["api", `repos/${slugOf(repo)}/pulls/${number}`, "--jq", ".mergeable"];
   const env = await readEnvFor("gh", args);
   return new Promise((resolve, reject) => {
-  const p = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"], ...(env ? { env } : {}) });
+  const p = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...(env ? { env } : {}) });
   let out = "", err = "";
   p.stdout.on("data", (d) => (out += d));
   p.stderr.on("data", (d) => (err += d));

@@ -22,7 +22,7 @@ export function checkoutRoot(): string {
 type Out = { code: number; stdout: Buffer };
 function git(gitDir: string, args: string[], input?: string): Promise<Out> {
   return new Promise((resolve, reject) => {
-    const p = spawn("git", [...HARDENING, ...args], { cwd: gitDir, env: { ...process.env, ...GIT_ENV, ...gitDirEnv(gitDir) }, stdio: ["pipe", "pipe", "ignore"], timeout: 300_000 });
+    const p = spawn("git", [...HARDENING, ...args], { cwd: gitDir, env: { ...process.env, ...GIT_ENV, ...gitDirEnv(gitDir) }, stdio: ["pipe", "pipe", "ignore"], timeout: 300_000, windowsHide: true });
     const chunks: Buffer[] = [];
     p.stdout.on("data", (d: Buffer) => chunks.push(d));
     p.on("error", reject);
@@ -35,7 +35,7 @@ function git(gitDir: string, args: string[], input?: string): Promise<Out> {
 /** Lists the tree of `sha`, killing git as soon as the listing alone shows more than `maxFiles` records or `maxBytes` of file sizes. */
 function lsTree(gitDir: string, sha: string, caps: CheckoutCaps): Promise<{ code: number; stdout: string; tooLarge: string | null }> {
   return new Promise((resolve, reject) => {
-    const p = spawn("git", [...HARDENING, "ls-tree", "-r", "-z", "-l", "--full-tree", sha], { cwd: gitDir, env: { ...process.env, ...GIT_ENV, ...gitDirEnv(gitDir) }, stdio: ["ignore", "pipe", "ignore"], timeout: 300_000 });
+    const p = spawn("git", [...HARDENING, "ls-tree", "-r", "-z", "-l", "--full-tree", sha], { cwd: gitDir, env: { ...process.env, ...GIT_ENV, ...gitDirEnv(gitDir) }, stdio: ["ignore", "pipe", "ignore"], timeout: 300_000, windowsHide: true });
     let text = "";
     let rest = "";
     let files = 0;

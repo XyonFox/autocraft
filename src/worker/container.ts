@@ -78,7 +78,7 @@ export function runArgs(cfg: WorkerConfig, s: RunSpec): string[] {
 }
 
 function exec(cmd: string, args: string[]): Promise<void> {
-  return new Promise((resolve) => execFile(cmd, args, { timeout: 30_000 }, () => resolve()));
+  return new Promise((resolve) => execFile(cmd, args, { timeout: 30_000, windowsHide: true }, () => resolve()));
 }
 
 export async function removeContainer(cfg: WorkerConfig, name: string): Promise<void> {
@@ -88,7 +88,7 @@ export async function removeContainer(cfg: WorkerConfig, name: string): Promise<
 /** Removes containers left by a previous worker process. */
 export async function removeStaleContainers(cfg: WorkerConfig): Promise<void> {
   const ids = await new Promise<string[]>((resolve) =>
-    execFile(cfg.runtime, ["ps", "-a", "-q", "--filter", `label=${LABEL}`], { timeout: 30_000 }, (err, out) => resolve(err ? [] : String(out).split("\n").filter((l) => /^[0-9a-zA-Z_.-]+$/.test(l)))),
+    execFile(cfg.runtime, ["ps", "-a", "-q", "--filter", `label=${LABEL}`], { timeout: 30_000, windowsHide: true }, (err, out) => resolve(err ? [] : String(out).split("\n").filter((l) => /^[0-9a-zA-Z_.-]+$/.test(l)))),
   );
   for (const id of ids) await exec(cfg.runtime, ["rm", "-f", id]);
 }
@@ -96,7 +96,7 @@ export async function removeStaleContainers(cfg: WorkerConfig): Promise<void> {
 export type RunOutcome = { exitCode: number | null; timedOut: boolean; cancelled: boolean } & MemoryReading;
 
 export async function runContainer(cfg: WorkerConfig, spec: RunSpec, o: { timeoutMs: number; signal: AbortSignal; onOutput: (b: Buffer) => void }): Promise<RunOutcome> {
-  const child = spawn(cfg.runtime, runArgs(cfg, spec), { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(cfg.runtime, runArgs(cfg, spec), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   child.stdout.on("data", o.onOutput);
   child.stderr.on("data", o.onOutput);
   const memory = sampleMemory(cfg.runtime, spec.name);

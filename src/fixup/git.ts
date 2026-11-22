@@ -28,7 +28,7 @@ export const exec: Exec = async (cmd, args, opts = {}) => {
 };
 
 const spawned = (cmd: string, args: string[], opts: ExecOpts, env: NodeJS.ProcessEnv | undefined): Promise<ExecResult> => new Promise((resolve, reject) => {
-  const p = spawn(cmd, args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], timeout: 300_000 });
+  const p = spawn(cmd, args, { cwd: opts.cwd, env, stdio: ["pipe", "pipe", "pipe"], timeout: 300_000, windowsHide: true });
   let stdout = "", stderr = "";
   p.stdout.on("data", (d) => (stdout += d));
   p.stderr.on("data", (d) => (stderr += d));

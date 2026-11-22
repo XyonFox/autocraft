@@ -56,7 +56,7 @@ function writeRecord(cfg: WorkerConfig, key: string, r: WarmRecord): void {
 }
 
 function run(cmd: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => execFile(cmd, args, { maxBuffer: 1 << 20 }, (err, out) => (err ? reject(err) : resolve(String(out)))));
+  return new Promise((resolve, reject) => execFile(cmd, args, { maxBuffer: 1 << 20, windowsHide: true }, (err, out) => (err ? reject(err) : resolve(String(out)))));
 }
 
 async function diskBytes(dir: string): Promise<number> {

@@ -556,6 +556,7 @@ export class Runner {
         detached: true,
         stdio: ["ignore", fd, fd],
         env: { ...dbEnv(this.o.dbTarget), AUTOCRAFT_JOB_GROUPS: groups },
+        windowsHide: true,
       });
     } finally {
       closeSync(fd);

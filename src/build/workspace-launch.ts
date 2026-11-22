@@ -490,7 +490,7 @@ export async function sourceArchive(repo: string, sha: string): Promise<{ bytes:
   return {
     bytes,
     open: async function* () {
-      const p = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"] });
+      const p = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
       const closed = new Promise<number | null>((ok) => {
         p.on("close", (code) => ok(code));
         p.on("error", () => ok(null));

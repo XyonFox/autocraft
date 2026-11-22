@@ -12,7 +12,7 @@ const ROOT = "/sys/fs/cgroup";
 /** The cgroup directory of a container's init process, or null when it cannot be resolved. */
 export async function cgroupDir(runtime: string, name: string): Promise<string | null> {
   const pid = await new Promise<string>((resolve) =>
-    execFile(runtime, ["inspect", "--format", "{{.State.Pid}}", name], { timeout: 10_000 }, (err, out) => resolve(err ? "" : String(out).trim())),
+    execFile(runtime, ["inspect", "--format", "{{.State.Pid}}", name], { timeout: 10_000, windowsHide: true }, (err, out) => resolve(err ? "" : String(out).trim())),
   );
   if (!/^[1-9][0-9]*$/.test(pid)) return null;
   try {

@@ -246,7 +246,7 @@ function pruneArchives(dir: string, keep: string): void {
 
 const gitOk = (args: string[], env: NodeJS.ProcessEnv): Promise<boolean> =>
   new Promise((ok) => {
-    const p = spawn("git", [...HARDENING, ...args], { env, stdio: "ignore" });
+    const p = spawn("git", [...HARDENING, ...args], { env, stdio: "ignore", windowsHide: true });
     p.on("error", () => ok(false));
     p.on("close", (code) => ok(code === 0));
   });
@@ -303,7 +303,7 @@ export async function archiveOf(lease: TaskLease, repo: string, sha: string, opt
     // A failed copy (disk full, the directory gone) is dropped; the client still gets its stream.
     let sinkFailed = false;
     sink.on("error", () => { sinkFailed = true; rmSync(tmp, { force: true }); });
-    git = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"] });
+    git = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     git.stdout!.pipe(out, { end: false });
     git.stdout!.pipe(sink);
     git.on("error", () => { out.destroy(new Error("git archive failed")); sink.destroy(); rmSync(tmp, { force: true }); release(); });

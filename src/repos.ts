@@ -49,7 +49,7 @@ export type RepoExists = (owner: string, name: string) => Promise<boolean>;
 export const ghRepoExists: RepoExists = async (owner, name) => {
   let env: Awaited<ReturnType<typeof readEnv>>;
   try { env = await readEnv(owner); } catch (e) { if (e instanceof AppReadError && e.notInstalled) return false; throw e; }
-  return new Promise((resolve) => execFile("gh", ["api", `repos/${owner}/${name}`, "--jq", ".full_name"], { timeout: 30_000, ...(env ? { env } : {}) }, (err) => resolve(!err)));
+  return new Promise((resolve) => execFile("gh", ["api", `repos/${owner}/${name}`, "--jq", ".full_name"], { timeout: 30_000, windowsHide: true, ...(env ? { env } : {}) }, (err) => resolve(!err)));
 };
 
 /**

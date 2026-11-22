@@ -79,7 +79,7 @@ export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
   const logCopy = await JobLogCopy.open(db, job, logPath);
   const copying = setInterval(() => void copyLogs(db, [logCopy]).catch(() => { /* the next copy reads the lines again */ }), JOB_LOG_FLUSH_MS);
   const child = spawn(process.execPath, [fileURLToPath(new URL("../cli.ts", import.meta.url)), "runner", "exec", String(job)], {
-    stdio: ["ignore", "pipe", "pipe"], env: dbEnv(dbTarget()),
+    stdio: ["ignore", "pipe", "pipe"], env: dbEnv(dbTarget()), windowsHide: true,
   });
   await db.run(db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", job));
   child.stdout.on("data", (b: Buffer) => { log.write(b); process.stdout.write(b); });
