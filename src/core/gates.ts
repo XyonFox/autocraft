@@ -12,7 +12,7 @@ export type Want<K extends ActionKind = ActionKind> = { kind: K; bucket?: string
 /** The repo approvals a write can need. */
 export type Approval = "merge" | "push" | "comment" | "ci" | "labels" | "fix-issue" | "main-fix";
 
-const WHAT: Record<Approval, string> = { merge: "Merges", push: "Pushes", comment: "Comments", ci: "CI run approvals", labels: "Labels", "fix-issue": "Issue fixes", "main-fix": "Main CI fixes" };
+const WHAT: Record<Approval, string> = { merge: "Merges", push: "Pushes", comment: "Comments", ci: "CI run approvals", labels: "Labels", "fix-issue": "Issue implementations", "main-fix": "Main CI fixes" };
 
 /** A repo's approvals and the global switch, as the repo-level guard loads them. */
 export type RepoApprovals = Record<Approval, boolean> & { pipelineOn: boolean };
@@ -33,6 +33,7 @@ export function approvalOf(f: { pushable?: boolean }, a: Want): Approval | null 
     // security-scan question is in scope for it whatever the pilot says; decideItem already covers that).
     case "label": return "labels";
     case "act": return "comment";
+    case "implement":
     case "fixissue":
     case "fixissue-collect": return "fix-issue";
     case "merge": return "merge";
@@ -55,10 +56,9 @@ export function approvalOf(f: { pushable?: boolean }, a: Want): Approval | null 
 /** Why the write is refused, or null. */
 export function gates(f: PrFacts | ItemFacts, a: Want, by: By): string | null {
   if (by === "pipeline" && !f.pipelineOn) return "The pipeline is off";
-  // A stage that stopped itself (circuit breaker) writes nothing until an operator resumes it, whoever asks.
+  // A stage that stopped itself on the item's repo (circuit breaker) writes nothing there until it is resumed, whoever asks.
   const stage = tripStageOf(a);
-  const trips = (f as { tripped?: Partial<Record<string, string>> }).tripped;
-  const tripped = stage && (trips?.[stage] ?? trips?.[`${stage}:${f.repo}`]);
+  const tripped = stage && f.tripped?.[stage];
   if (tripped) return `${stage[0]!.toUpperCase()}${stage.slice(1)} is paused: ${tripped}`;
   const need = approvalOf(f as { pushable?: boolean }, a);
   if (!need) return null;

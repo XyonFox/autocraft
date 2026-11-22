@@ -1,7 +1,8 @@
 // autocraft-server runner serve | exec | enqueue | jobs | cancel | steps; autocraft-server pipeline on | off | status | limit
+import { readSecrets } from "../dash/server/config.ts";
 import { writeSetting } from "../settings-read.ts";
 import { resumeStage, TripError } from "../push-outcomes.ts";
-import { startWorkerServer } from "../build/worker-api.ts";
+import { DEFAULT_WORKER_LISTEN, startWorkerServer } from "../build/worker-api.ts";
 import { startPodLauncher } from "../build/launcher.ts";
 import { acquireLock } from "../mirror.ts";
 import { audit } from "../dash/audit.ts";
@@ -22,7 +23,10 @@ import { dropPlanChanges } from "../db/sqlite-backfill.ts";
 import { dbReady, startHealthServer } from "../health.ts";
 import { envVar } from "../env.ts";
 import { startDiscord } from "../discord/index.ts";
-import { openDb, setDbRole } from "../db/open.ts";
+import { closeDb, openDb, setDbRole } from "../db/open.ts";
+import { elect, LOST_LEADER_EXIT } from "../db/leader.ts";
+import { assertFence, FencedError, setFence } from "../db/fence.ts";
+import { writeSync } from "node:fs";
 
 const USAGE = `usage: autocraft-server runner serve
        autocraft-server runner steps
@@ -42,6 +46,48 @@ async function serve(): Promise<void> {
   setDbRole("runner");
   const db = await openDb();
   await scopeToTracked(db);
+  const ac = new AbortController();
+  process.once("SIGTERM", () => ac.abort());
+  process.once("SIGINT", () => ac.abort());
+  // On a stop signal the runner claims nothing new and stops its jobs (10 s each to end, then killed). If that takes longer than the bound, exit anyway.
+  const stopMs = (Number(envVar("STOP_TIMEOUT")) || 25) * 1000;
+  // process.exit joins the worker threads, and a thread inside one long synchronous call cannot be terminated until the call returns: kill the process instead (the database is in WAL mode and survives it).
+  const onStop = () => void setTimeout(() => (console.error("runner: stop timed out; exiting"), release(), process.kill(process.pid, "SIGKILL")), stopMs).unref();
+  if (ac.signal.aborted) onStop();
+  else ac.signal.addEventListener("abort", onStop, { once: true });
+
+  // Of several copies on one Postgres database, one leads and the others wait (src/db/leader.ts). A standby answers the
+  // probes on the worker API's address, /readyz with 503, so a Service sends workers only to the leader.
+  let leading = false;
+  const state = () => (leading ? "leader" : "standby");
+  const workerListen = envVar("WORKER_LISTEN") ?? DEFAULT_WORKER_LISTEN;
+  let standbyProbes: Promise<{ close: () => Promise<void> } | null> | null = null;
+  // Optional listener for the probes alone, for a runner whose worker API is not reachable by the prober.
+  const healthListen = envVar("HEALTH_LISTEN");
+  const health = healthListen
+    ? await startHealthServer(healthListen, async () => leading && await dbReady(db), state).then(
+        (h) => (console.log(`runner: health endpoints on ${h.url}`), h),
+        (e: Error) => (console.error(`runner: health listener not started: ${e.message}`), null),
+      )
+    : null;
+  const lease = await elect(db, "runner", {
+    signal: ac.signal,
+    onStandby: () => {
+      standbyProbes = startHealthServer(workerListen, async () => false, state).catch((e: Error) => (console.error(`runner: standby probes not started: ${e.message}`), null));
+    },
+  });
+  // The worker API takes the address over.
+  await (await (standbyProbes as Promise<{ close: () => Promise<void> } | null> | null))?.close();
+  if (!lease) {
+    await health?.close();
+    release();
+    await closeDb();
+    console.log("runner: stopped while standby");
+    return;
+  }
+  if (lease.epoch) setFence({ role: "runner", epoch: lease.epoch });
+  leading = true;
+
   // Once per database: open decisions' proposed cards become choices. Here rather than in db.ts migrations, which cannot import the decision modules.
   const conv = await convertOpenDecisionsOnce(db);
   if (conv) console.log(`runner: converted ${conv.converted} open decisions to choices (${conv.skipped} skipped, ${conv.stale} stale cards, ${conv.unconverted} cards matching no choice)`);
@@ -51,42 +97,43 @@ async function serve(): Promise<void> {
   const fixes = await autoFixConfirmed(db);
   if (fixes) console.log(`runner: started the private fix of ${fixes} confirmed security findings`);
   const runner = new Runner({ db, lockFile: lock, maxJobs: Number(envVar("RUNNER_JOBS")) || DEFAULT_MAX_JOBS });
-  const ac = new AbortController();
-  process.once("SIGTERM", () => ac.abort());
-  process.once("SIGINT", () => ac.abort());
+  // Fencing: a leader that lost its lock starts nothing more, kills its jobs and exits at once, so its container restarts
+  // as a standby. Its writes already fail (src/db/fence.ts); the new leader resumes the jobs as after a crash. GitHub and
+  // Kubernetes calls already in flight finish; the pod launcher checks the fence before each Kubernetes change.
+  const fenced = () => {
+    runner.abandon();
+    writeSync(2, `runner: lost the leader lock (${String((lease.lost.reason as Error | undefined)?.message ?? "")}); jobs killed, exiting\n`);
+    process.exit(LOST_LEADER_EXIT);
+  };
+  if (lease.lost.aborted) fenced();
+  lease.lost.addEventListener("abort", fenced, { once: true });
   console.log(`runner: started on ${(await loadSteps()).size} steps`);
   // A failure to listen (port in use) must not stop the pipeline; workers just cannot connect.
-  const workers = await startWorkerServer({ db, log: (l) => console.log(l) }).then(
+  // The session key signs the dashboard's requests for the runner's files (build artifacts, Claude accounts).
+  let internalKey: string | null = null;
+  try { internalKey = readSecrets(envVar("SECRETS_FILE")).sessionKey; } catch { /* logged at the first dashboard request, when a split install makes it matter */ }
+  const workers = await startWorkerServer({ db, internalKey, log: (l) => console.log(l) }).then(
     (w) => (console.log(`runner: worker API on ${w.url}`), w),
     (e: Error) => (console.error(`runner: worker API not started: ${e.message}`), null),
   );
   // Starts and follows the build pods of kubernetes environments; outside a cluster they report that they cannot.
-  startPodLauncher(db, ac.signal, (l) => console.log(l));
+  startPodLauncher(db, ac.signal, (l) => console.log(l), async () => {
+    if (lease.lost.aborted) throw new FencedError("this process no longer leads the runner");
+    await assertFence(db);
+  });
   // Optional: counts Discord mentions of tracked items when a bot token file is configured. A failure is logged and never stops the runner.
   try {
     await startDiscord(db, ac.signal, (l) => console.log(l));
   } catch (e) {
     console.error(`runner: Discord not started: ${(e as Error).message}`);
   }
-  // Optional listener for the probes alone, for a runner whose worker API is not reachable by the prober.
-  const healthListen = envVar("HEALTH_LISTEN");
-  const health = healthListen
-    ? await startHealthServer(healthListen, async () => await dbReady(db)).then(
-        (h) => (console.log(`runner: health endpoints on ${h.url}`), h),
-        (e: Error) => (console.error(`runner: health listener not started: ${e.message}`), null),
-      )
-    : null;
-  // On a stop signal the runner claims nothing new and stops its jobs (10 s each to end, then killed). If that takes longer than the bound, exit anyway.
-  const stopMs = (Number(envVar("STOP_TIMEOUT")) || 25) * 1000;
-  // process.exit joins the worker threads, and a thread inside one long synchronous call cannot be terminated until the call returns: kill the process instead (the database is in WAL mode and survives it).
-  const onStop = () => void setTimeout(() => (console.error("runner: stop timed out; exiting"), release(), process.kill(process.pid, "SIGKILL")), stopMs).unref();
-  if (ac.signal.aborted) onStop();
-  else ac.signal.addEventListener("abort", onStop, { once: true });
   try {
     await runner.serve(ac.signal, Number(envVar("RUNNER_POLL_MS")) || 2000);
   } finally {
+    lease.lost.removeEventListener("abort", fenced);
     await health?.close();
     await workers?.close();
+    await lease.release();
     release();
     await db.close();
   }
@@ -154,7 +201,7 @@ async function cancel(args: string[]): Promise<void> {
 const SUB: Record<string, (args: string[]) => Promise<void> | void> = { serve, exec, steps, enqueue: enqueueCmd, jobs, cancel };
 
 export const commands = {
-  pipeline: { summary: "pipeline switch and limits: on | off | drain | status | limit <step> --per-day N | resume <stage>", run: (args: string[]) => pipeline(args) },
+  pipeline: { summary: "pipeline switch and limits: on | off | drain | status | limit <step> --per-day N | resume <stage>[:<repo>]", run: (args: string[]) => pipeline(args) },
   runner: {
     summary: "pipeline runner: serve | steps | enqueue | jobs | cancel",
     run: async (args: string[]) => {
@@ -198,7 +245,7 @@ const PIPELINE_USAGE = `usage: autocraft-server pipeline on [--if-draining] | of
        autocraft-server pipeline parallel [<N|none>]
        autocraft-server pipeline review-interval [<minutes>]
        autocraft-server pipeline pick-minutes [<minutes>]
-       autocraft-server pipeline resume <fixup|cifix|fixissue|merge>
+       autocraft-server pipeline resume <fixup|cifix|implement|merge>[:<repo>] | outside-surge
        autocraft-server pipeline pilot set <repo#number>... | show | clear`;
 
 // Recorded as `cli`: only someone with a shell on the host can run this.
@@ -291,5 +338,6 @@ async function pipeline(args: string[]): Promise<void> {
   console.log(`pipeline ${s.enabled ? "ON" : s.draining ? "DRAINING" : "OFF"}${s.changedAt ? ` (set by ${s.changedBy} at ${s.changedAt.slice(0, 16)})` : ""}`);
   for (const l of s.limits) {
     console.log(`${l.step.padEnd(14)} ${String(l.usedToday).padStart(5)} / ${l.perDay === null ? "no limit" : l.perDay}${l.pausedReason ? `  ${l.pausedReason}` : ""}`);
+    for (const t of l.trips ?? []) console.log(`${"".padEnd(14)} tripped ${t.repo ? `in ${t.repo}` : "on every repo"}: ${t.reason} (resume ${t.key})`);
   }
 }

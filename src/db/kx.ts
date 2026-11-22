@@ -286,6 +286,15 @@ export function excluded<C extends string>(cols: readonly C[]): (eb: ExpressionB
   return (eb) => Object.fromEntries(cols.map((c) => [c, eb.ref(`excluded.${c}`) as Expression<any>]) as [C, Expression<any>][]) as Record<C, Expression<any>>;
 }
 
+/** Rows per multi-row statement: a row of ten bound values keeps a statement far under both engines' parameter limits. */
+export const BATCH_ROWS = 500;
+
+/**
+ * `rows` in slices of BATCH_ROWS, for multi-row inserts and `IN` lists: on Postgres every statement is a network round
+ * trip, so a write per row costs a round trip per row inside the write lock.
+ */
+export const batches = <T>(rows: readonly T[]): T[][] => Array.from({ length: Math.ceil(rows.length / BATCH_ROWS) }, (_, i) => rows.slice(i * BATCH_ROWS, (i + 1) * BATCH_ROWS));
+
 /**
  * INSERT OR REPLACE of one row, for a table whose readers follow rowid changes: the row ends up with a rowid above every
  * other. SQLite runs the statement itself (REPLACE allocates the new rowid before it deletes the old row, so even the row

@@ -28,8 +28,8 @@ export function createAreasMock(me: User, changed: () => void): Pick<Api, "areas
     }
     return r;
   };
-  const need = () => {
-    if (me.role !== "operator") throw new Error("only operators change area lists");
+  const need = (repo?: string) => {
+    if (me.role === "viewer" || (repo !== undefined && !me.runRepos.includes(repo))) throw new Error("no write access to this repo");
   };
   const snap = (r: RepoAreas): RepoAreas => structuredClone(r);
   const save = (r: RepoAreas, note: string) => {
@@ -51,7 +51,7 @@ export function createAreasMock(me: User, changed: () => void): Pick<Api, "areas
         return snap(of(repo));
       },
       async edit(repo, e) {
-        need();
+        need(repo);
         const r = of(repo);
         switch (e.op) {
           case "add":
@@ -72,14 +72,14 @@ export function createAreasMock(me: User, changed: () => void): Pick<Api, "areas
             return save(r, `edited the description of ${e.name}`);
         }
       },
-      async run() {
-        need();
+      async run(repo) {
+        need(repo);
         return { jobId: nextJob++ };
       },
       async accept(id, body) {
-        need();
         const r = [...state.values()].find((x) => x.proposals.some((p) => p.id === id));
         if (!r) throw new Error("no such proposal");
+        need(r.repo);
         const p = r.proposals.find((x) => x.id === id)!;
         if (p.kind === "propose") r.areas = (body?.areas ?? p.areas).map(({ name, description }) => ({ name, description }));
         else r.areas.push(...p.areas.filter((a) => body?.accept?.includes(a.name)).map(({ name, description }) => ({ name, description })));
@@ -87,7 +87,7 @@ export function createAreasMock(me: User, changed: () => void): Pick<Api, "areas
         return save(r, "saved a new list");
       },
       async dismiss(id) {
-        need();
+        need([...state.values()].find((r) => r.proposals.some((p) => p.id === id))?.repo);
         for (const r of state.values()) r.proposals = r.proposals.filter((p) => p.id !== id);
         changed();
       },

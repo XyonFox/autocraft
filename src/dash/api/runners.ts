@@ -7,7 +7,7 @@ import { maintainerWritesOn } from "../../settlers.ts";
 import { audit } from "../audit.ts";
 import { answering } from "../mcp/index.ts";
 import { revokeToken, setRunnerScopes, type Scopes } from "../mcp/tokens.ts";
-import { HttpError, RateLimiter } from "../server/util.ts";
+import { HttpError, RateLimiter, share } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { approveLogin, denyLogin, normalizeCode, pendingLogin } from "../../remote/device-login.ts";
 import { listHelpers } from "../../remote/helpers.ts";
@@ -16,7 +16,7 @@ import type { Machine, PendingRunnerLogin, RunnersReply } from "../../remote/pro
 import type { Db } from "../../db/index.ts";
 
 /** Lookups of a user code that found no waiting login, per login: guessing codes is slow. */
-const failedLookups = new RateLimiter(10, 10 * 60_000);
+const failedLookups = new RateLimiter(share(10), 10 * 60_000);
 
 const body = (req: Req): Record<string, unknown> => {
   const b = req.json;

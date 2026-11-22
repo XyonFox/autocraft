@@ -19,6 +19,8 @@ export const RUNNER_STOPPED = "The runner stopped while this job ran; start it a
 /** Error of a job the runner stopped for running past its step's deadline; set when the stop is asked, so the job can finish its current item. */
 export const DEADLINE_ERROR = /^stopped: (ran past|no progress for) /;
 export const now = (): string => new Date().toISOString();
+/** Requester of a job that a command line queues for the runner to run (`workspace try`), as opposed to a command-line run (`cli`). */
+export const CLI_QUEUE_BY = "cli-queue";
 
 export class JobError extends Error {
   status: number;
@@ -166,6 +168,7 @@ export async function pruneJobs(db: Db, nowMs: number = Date.now()): Promise<num
         }
       }
       await db.run(db.k.deleteFrom("job_items").where("job_id", "=", r.id));
+      await db.run(db.k.deleteFrom("job_log_chunks").where("job_id", "=", r.id));
       await db.run(db.k.deleteFrom("jobs").where("id", "=", r.id));
       n++;
     }
@@ -181,16 +184,26 @@ import type { Db } from "../db/index.ts";
 import type { DB } from "../db/types.ts";
 import type { SelectQueryBuilder } from "kysely";
 import { cols, like } from "../db/kx.ts";
+import { storedLogTail } from "./job-log.ts";
 
 export const LOG_TAIL_BYTES = 48 * 1024;
 
-export function logTail(path: string | null, bytes = LOG_TAIL_BYTES): { log: string; logTruncated: boolean } {
-  if (!path) return { log: "", logTruncated: false };
+/** The end of a job's log: from its log file when this process can read it (it shares the runner's disk), else as the runner stored it. */
+export async function jobLogTail(db: Db, id: number, path: string | null, bytes = LOG_TAIL_BYTES): Promise<{ log: string; logTruncated: boolean }> {
+  const local = logTail(path, bytes);
+  if (local) return local;
+  const stored = await storedLogTail(db, id, bytes);
+  return stored ? { log: scrub(stored.log), logTruncated: stored.logTruncated } : { log: "", logTruncated: false };
+}
+
+/** The end of a log file; null when there is none to read here. */
+export function logTail(path: string | null, bytes = LOG_TAIL_BYTES): { log: string; logTruncated: boolean } | null {
+  if (!path) return null;
   let fd: number;
   try {
     fd = openSync(path, "r");
   } catch {
-    return { log: "", logTruncated: false };
+    return null;
   }
   try {
     const size = fstatSync(fd).size;
@@ -217,9 +230,9 @@ export async function jobDetail(db: Db, id: number, view: { hidden?: HiddenRepos
   const shown = shownLookup(db);
   const items = await mapSeq((await db.all(db.k.selectFrom("job_items").select(["repo", "number", "outcome", "ref"]).where("job_id", "=", id).orderBy("id")))
     .filter((i) => !isHiddenRepo(hidden, i.repo)), async (i) => ({ repo: i.repo, number: i.number, ...await shown(i.repo, i.number), outcome: i.outcome, decision: i.ref }));
-  if (view.logs === false) return { ...(await toJobs(db, [r]))[0]!, items, log: null, logTruncated: false };
-  const tail = logTail(r.log_path);
-  return { ...(await toJobs(db, [r]))[0]!, items, ...tail, log: tail.log && hidden.length ? tail.log.split("\n").filter((l) => !l || blankIfHidden(l, hidden)).join("\n") : tail.log };
+  if (view.logs === false) return { ...(await toJobs(db, [r]))[0]!, items, log: null, logTruncated: false, canCancel: false };
+  const tail = await jobLogTail(db, id, r.log_path);
+  return { ...(await toJobs(db, [r]))[0]!, items, canCancel: false, ...tail, log: tail.log && hidden.length ? tail.log.split("\n").filter((l) => !l || blankIfHidden(l, hidden)).join("\n") : tail.log };
 }
 
 /**
@@ -227,7 +240,8 @@ export async function jobDetail(db: Db, id: number, view: { hidden?: HiddenRepos
  * start, with a fresh deadline. Its remote calls stay for the resumed run to adopt (enqueueCall), with their agent runs;
  * the stopped process's local model calls, model-queue waits and work leases end. False, and nothing changes, when it may
  * not resume: a cancel was asked, it was told to stop at its deadline, it resumed MAX_RESUMES times already, or it is a
- * command-line run (`requested_by` cli: its process belongs to the command, which records its end).
+ * command-line run (`requested_by` cli: its process belongs to the command, which records its end). A job a command only
+ * queues (CLI_QUEUE_BY) runs under the runner like any other, so it resumes.
  */
 export async function resumeJob(db: Db, id: number, why: string): Promise<boolean> {
   const r = await db.get(db.k.updateTable("jobs")

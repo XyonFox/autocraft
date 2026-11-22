@@ -101,7 +101,7 @@ export async function spawnRun(cmd: string, args: string[], env?: Record<string,
   // Without an environment of its own, a gh command reads and writes as the current identity (the app's token under `app`).
   const own = env ? undefined : await readEnvFor(cmd, args);
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: own ?? (env ? (replaceEnv ? env : { ...process.env, ...env }) : process.env) });
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: own ?? (env ? (replaceEnv ? env : { ...process.env, ...env }) : process.env) });
     let stdout = "", stderr = "";
     p.stdout.on("data", (d) => (stdout += d));
     p.stderr.on("data", (d) => (stderr += d));

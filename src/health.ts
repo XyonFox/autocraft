@@ -16,22 +16,22 @@ export async function dbReady(db: Db): Promise<boolean> {
 /** Headers every probe answer carries: no sniffing, no framing, no loading of anything. */
 export const PROBE_HEADERS = { "x-content-type-options": "nosniff", "x-frame-options": "DENY", "content-security-policy": "default-src 'none'" };
 
-/** Answers GET/HEAD /healthz (process up) and /readyz (`ready()`); returns false for any other request. */
-export async function serveHealth(req: IncomingMessage, res: ServerResponse, ready: () => Promise<boolean>): Promise<boolean> {
+/** Answers GET/HEAD /healthz (process up) and /readyz (`ready()`); returns false for any other request. `state` names what the process does, when it says more than "ok". */
+export async function serveHealth(req: IncomingMessage, res: ServerResponse, ready: () => Promise<boolean>, state?: () => string): Promise<boolean> {
   const path = (req.url ?? "").split("?")[0];
   if ((req.method !== "GET" && req.method !== "HEAD") || (path !== "/healthz" && path !== "/readyz")) return false;
   const ok = path === "/healthz" || await ready();
-  const body = ok ? "ok\n" : "not ready\n";
+  const body = `${ok ? "ok" : "not ready"}${state ? `: ${state()}` : ""}\n`;
   res.writeHead(ok ? 200 : 503, { ...PROBE_HEADERS, "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "content-length": Buffer.byteLength(body) });
   res.end(req.method === "HEAD" ? undefined : body);
   return true;
 }
 
 /** A listener that serves only the probes (AUTOCRAFT_HEALTH_LISTEN, host:port). */
-export async function startHealthServer(listen: string, ready: () => Promise<boolean>): Promise<{ url: string; close: () => Promise<void> }> {
+export async function startHealthServer(listen: string, ready: () => Promise<boolean>, state?: () => string): Promise<{ url: string; close: () => Promise<void> }> {
   const { host, port } = parseListen(listen);
   const server: Server = createServer({ requestTimeout: 10_000, headersTimeout: 5_000, maxHeaderSize: 4 * 1024 }, (req, res) => {
-    void serveHealth(req, res, ready).then((served) => {
+    void serveHealth(req, res, ready, state).then((served) => {
       if (served) return;
       res.writeHead(404, { ...PROBE_HEADERS, "content-type": "text/plain; charset=utf-8" });
       res.end("not found\n");

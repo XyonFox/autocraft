@@ -12,6 +12,7 @@ import { QueueBadge } from "../../../ui/molecules/QueueBadge";
 import { Segmented } from "../../../ui/molecules/Segmented";
 import { useIsPhone } from "../../../shell/useMedia";
 import { useUser } from "../../../shell/UserContext";
+import { canRun } from "../../../registry/permissions";
 import { AutoCraftSide } from "./AutoCraftSide";
 import { GithubSide } from "./GithubSide";
 import { revealWhenReady } from "../../../lib/revealElement";
@@ -158,7 +159,7 @@ function Header({ d }: { d: ItemPageData }) {
         <a href={safeHref(d.github.url)} target="_blank" rel="noopener noreferrer" className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded border border-line-strong bg-raised px-2.5 text-xs font-medium hover:bg-ink/[0.06] max-md:h-11">
           See in GitHub <ArrowSquareOutIcon />
         </a>
-        {(user.role === "operator" || h.backlog.canSettle) && <ItemMenu d={d} />}
+        {(canRun(user, d.repo) || h.backlog.canSettle) && <ItemMenu d={d} />}
       </div>
       <StatusBar d={d} />
     </header>

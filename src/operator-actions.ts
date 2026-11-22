@@ -2,6 +2,7 @@
 // plan Verify again after it failed or errored, try a skipped or failed issue fix again, try the integration batch
 // again after a single-PR batch failed. Each changes
 // only local tables (the pipeline then picks the item up as usual) and is audited; none writes to GitHub.
+import { FIX_RETIRED_REASON } from "./db/fix-retire.ts";
 import { audit } from "./dash/audit.ts";
 import { batchStates, updateBatch } from "./merge/batch-store.ts";
 import { headOf } from "./review/candidates.ts";
@@ -36,7 +37,9 @@ const failedVerify = async (db: Db, repo: string, n: number, head: string | null
   head ? await db.get(db.k.selectFrom("verifications").select(["state", "summary"]).where("repo", "=", repo).where("number", "=", n).where("head_sha", "=", head).where("state", "in", ["failed", "error"])) : undefined;
 export const stoppedFix = async (db: Db, repo: string, n: number) =>
   await db.get(db.k.selectFrom("fix_attempts").select(["state", "round", "retries", "push_tries", "reason", "summary"])
-    .where("repo", "=", repo).where("number", "=", n).where("state", "in", ["skipped", "failed"]).where("pr_url", "is", null));
+    .where("repo", "=", repo).where("number", "=", n).where("state", "in", ["skipped", "failed"]).where("pr_url", "is", null)
+    // An attempt the Implement migration ended is not the fix step's to retry.
+    .where((eb) => eb.or([eb("reason", "is", null), eb("reason", "<>", FIX_RETIRED_REASON)])));
 
 const failedBatch = async (db: Db, repo: string, n: number, head: string | null) =>
   head && (await batchStates(db, repo)).get(`${repo}#${n}@${head}`) === "batch-failed"

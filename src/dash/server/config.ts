@@ -1,4 +1,4 @@
-import { chmodSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,7 @@ import { randomToken } from "./crypto.ts";
 import { dbTarget } from "../../db/open.ts";
 import { defaultImageCacheDir } from "./images.ts";
 import { envVar } from "../../env.ts";
+import { dashReplicas } from "./util.ts";
 
 // The GitHub App that AutoCraft registered through the manifest flow. The
 // private key and client secret leave this object only to sign a JWT or to
@@ -17,31 +18,6 @@ export type AppSecrets = {
 };
 export type AppOwner = { login: string; type: "User" | "Organization" };
 export type Secrets = { githubClientId: string; githubClientSecret: string; sessionKey: string; app: AppSecrets | null };
-
-/**
- * Makes `secrets.app` follow the secrets file: it is read again whenever the file changes (another process or a
- * registration may have rewritten it), so registering or removing the app takes effect without a restart. An
- * unreadable file keeps the last good value.
- */
-export function followAppSecrets(secrets: Secrets, file: string): void {
-  const stampOf = (): string => { try { const st = statSync(file); return `${st.ino}:${st.size}:${st.mtimeMs}`; } catch { return "none"; } };
-  let cached = secrets.app;
-  let stamp = stampOf();
-  Object.defineProperty(secrets, "app", {
-    enumerable: true, configurable: true,
-    get(): AppSecrets | null {
-      const now = stampOf();
-      if (now !== stamp) {
-        if (now === "none") { cached = null; stamp = now; }
-        else {
-          try { cached = appSecretsOf(JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>); stamp = now; } catch { /* mid-write or unreadable: keep the last good value */ }
-        }
-      }
-      return cached;
-    },
-    set(v: AppSecrets | null) { cached = v; stamp = stampOf(); },
-  });
-}
 
 function configuredDb(env: NodeJS.ProcessEnv): string {
   try {
@@ -63,7 +39,7 @@ export type Config = {
   trustProxy: number;              // proxies in front of the server that append to X-Forwarded-For; 0: use the socket address
   imageCacheDir: string | null;    // the image proxy's disk cache; null: none
   secrets: Secrets;
-  secretsFile: string | null;      // where registration writes the app's secrets
+  secretsFile: string | null;      // the secrets file; its GitHub App keys are imported into the database once (src/github/app-keys.ts)
 };
 
 export const DEFAULT_WEB_DIST = fileURLToPath(new URL("../../../web/dist", import.meta.url));
@@ -142,76 +118,16 @@ export function appSecretsOf(raw: Record<string, unknown>): AppSecrets | null {
   return { id, slug, privateKey, clientId, clientSecret, webhookSecret: opt("github_app_webhook_secret"), owner };
 }
 
-function readRawSecrets(path: string): Record<string, unknown> {
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new ConfigError("secrets file is not valid JSON");
-  }
-}
+let devSessionKey: string | undefined;
 
-/** A sibling of the target with a random name, created exclusively (`wx`) so it never follows or replaces an existing file. */
-function writeTemp(target: string, body: string): string {
-  const tmp = `${target}.${randomToken(6)}.tmp`;
+/** The session_key of a dev secrets file, when it has one long enough. */
+function devFileKey(file: string | undefined): string | null {
+  if (!file) return null;
   try {
-    writeFileSync(tmp, body, { mode: 0o600, flag: "wx" });
-    chmodSync(tmp, 0o600);
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* not created */ }
-    throw e;
-  }
-  return tmp;
-}
-
-/** The file a write must replace: the secrets file itself, or the file a symlink there points to. */
-function secretsTarget(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return path;
-    throw e;
-  }
-}
-
-/** Throws unless a later `writeAppSecrets` can succeed: the file parses and a temporary file can be created beside it. */
-export function checkSecretsWritable(path: string): void {
-  readRawSecrets(path);
-  unlinkSync(writeTemp(secretsTarget(path), ""));
-}
-
-/**
- * Adds the app's keys to the secrets file through a temporary file in the same
- * directory and a rename, mode 0600. Other keys stay as they are, and a
- * symlinked secrets file stays a symlink.
- */
-export function writeAppSecrets(path: string, app: AppSecrets): void {
-  const target = secretsTarget(path);
-  const next = {
-    ...readRawSecrets(target),
-    github_app_id: app.id, github_app_slug: app.slug, github_app_private_key: app.privateKey,
-    github_app_client_id: app.clientId, github_app_client_secret: app.clientSecret, github_app_webhook_secret: app.webhookSecret ?? "",
-    github_app_owner: app.owner,
-  };
-  const tmp = writeTemp(target, `${JSON.stringify(next, null, 2)}\n`);
-  try {
-    renameSync(tmp, target);
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* already gone */ }
-    throw e;
-  }
-}
-
-/** Removes every `github_app_*` key from the file the same way: temporary file, rename, mode 0600. */
-export function removeAppSecrets(path: string): void {
-  const target = secretsTarget(path);
-  const next = Object.fromEntries(Object.entries(readRawSecrets(target)).filter(([k]) => !k.startsWith("github_app_")));
-  const tmp = writeTemp(target, `${JSON.stringify(next, null, 2)}\n`);
-  try {
-    renameSync(tmp, target);
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* already gone */ }
-    throw e;
+    const k = (JSON.parse(readFileSync(file, "utf8")) as { session_key?: unknown }).session_key;
+    return typeof k === "string" && k.length >= 32 ? k : null;
+  } catch {
+    return null;
   }
 }
 
@@ -223,7 +139,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (devAuth) {
     if (!isLoopback(host)) throw new ConfigError("AUTOCRAFT_DEV_AUTH=1 is allowed only on a loopback listen address");
     // Dev sessions don't survive a restart: the key lives only in this process.
-    secrets = { githubClientId: "dev", githubClientSecret: "dev", sessionKey: randomToken(), app: null };
+    // A dev secrets file's session_key keeps what is sealed with it (the GitHub App's keys) readable after a restart.
+    secrets = { githubClientId: "dev", githubClientSecret: "dev", sessionKey: devFileKey(envVar("SECRETS_FILE", env)) ?? (devSessionKey ??= randomToken()), app: null };
   } else {
     secrets = readSecrets(envVar("SECRETS_FILE", env));
   }
@@ -231,13 +148,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // A dev server reads the app's keys from a secrets file when one is given, so registration can be tried locally.
   if (devAuth && secretsFile) {
     let loose = false;
-    try { loose = (statSync(secretsFile).mode & 0o077) !== 0; } catch { /* no file yet */ }
+    try { loose = (statSync(secretsFile).mode & 0o077) !== 0; } catch { /* no file */ }
     if (loose) throw new ConfigError("secrets file is readable or writable by group or others; chmod 600 it");
-    try {
-      secrets.app = appSecretsOf(JSON.parse(readFileSync(secretsFile, "utf8")) as Record<string, unknown>);
-    } catch { /* no file yet: registration creates it */ }
   }
-  if (secretsFile) followAppSecrets(secrets, secretsFile);
   const rawBaseUrl = envVar("BASE_URL", env);
   if (rawBaseUrl) {
     let u: URL;
@@ -255,6 +168,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   } else if (!devAuth) {
     throw new ConfigError("AUTOCRAFT_BASE_URL is not set");
   }
+  try { dashReplicas(env); } catch (e) { throw new ConfigError((e as Error).message); }
   const webDistEnv = envVar("WEB_DIST", env);
   const trustRaw = envVar("TRUST_PROXY", env) || "0";
   if (!/^[0-9]$/.test(trustRaw)) throw new ConfigError("AUTOCRAFT_TRUST_PROXY must be the number of trusted proxies in front of the server, 0 to 9");

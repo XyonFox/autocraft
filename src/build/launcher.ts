@@ -10,7 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Requires, SandboxEnv, TaskResult, TaskStep } from "../../web/src/api/types.ts";
 import { envVar } from "../env.ts";
 import { hashKey, kubeReport, newPodKey, type EnvHealth } from "./envs.ts";
-import { inClusterApi, type ContainerStatus, type KPod, type KubeApi } from "./kube-api.ts";
+import { guardedApi, inClusterApi, type ContainerStatus, type KPod, type KubeApi } from "./kube-api.ts";
 import {
   DISK_CONTAINER, envSelector, FIRST_GROUP, groupsOf, CREATE_TRIES, kubeCapabilities, LIST_GRACE_MS, PACKAGES_CONTAINER, parsePrepared, PENDING_LIMIT_MS, PENDING_WARN_MS, PULL_LIMIT_MS,
   PULL_REASONS, pvcSpec, settingsOf, sourcePod, STAGE_SOURCE, STAGE_TASK, stepCap, stepContainer, stepPod, STUCK_MS, taskPod, toolchainImage, uploadPod, uploadStage,
@@ -423,8 +423,10 @@ async function finish(c: EnvCtx, run: Run, failed: string | null): Promise<void>
 }
 
 /** Runs build-task and workspace passes until `signal` aborts. Started by the runner; a pass with no kubernetes environment reads one table. */
-export function startPodLauncher(db: Db, signal: AbortSignal, log: (line: string) => void): void {
-  const deps: LauncherDeps = { db, api: inClusterApi(), defaultImage: envVar("IMAGE") ?? null, log };
+/** `guard` runs before every Kubernetes call that changes something, and stops it by throwing (src/build/kube-api.ts guardedApi). */
+export function startPodLauncher(db: Db, signal: AbortSignal, log: (line: string) => void, guard?: () => Promise<void>): void {
+  const api = inClusterApi();
+  const deps: LauncherDeps = { db, api: api && guard ? guardedApi(api, guard) : api, defaultImage: envVar("IMAGE") ?? null, log };
   const state = new LauncherState();
   const workspaces = new WorkspaceState();
   void (async () => {

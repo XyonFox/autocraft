@@ -15,6 +15,7 @@ import { clockLine, saveTools, type ToolClock } from "../agents/tools.ts";
 import { fixTurnMessage, mergeFixFields, needsFixTurn, type Lint, type LintProblem } from "../replylint.ts";
 import { coalesce, lineFeed } from "./progress.ts";
 import { scrubError } from "../agents/text.ts";
+import { registerGroup, unregisterGroup } from "../runner/groups.ts";
 import { hasFixedCredential, scrub } from "../runner/scrub.ts";
 import { itemTools } from "../itemtools/index.ts";
 import { startBridge, CHECK_SERVER, type Bridge } from "../checktool/bridge.ts";
@@ -85,6 +86,7 @@ export function exec(cmd: string, args: string[], input: string, cwd?: string, t
   return new Promise((resolve) => {
     // With a watchdog the child leads its own process group, so the stop reaches everything it started.
     const p = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true, ...(watch && { detached: true }), ...(env && { env: exactEnv ? env : { ...process.env, ...env } }) });
+    if (watch) registerGroup(p.pid);
     let stdout = "", stderr = "";
     let partial = "";
     let last = Date.now(), idle = false, ended = false;
@@ -97,7 +99,7 @@ export function exec(cmd: string, args: string[], input: string, cwd?: string, t
       setTimeout(() => { if (!ended) signal("SIGKILL"); }, IDLE_KILL_GRACE_MS).unref();
     }, Math.max(10, Math.min(30_000, Math.floor(watch.idleMs / 4))));
     timer?.unref();
-    const done = (r: Proc) => { ended = true; if (timer) clearInterval(timer); resolve(idle ? { ...r, idle: true } : r); };
+    const done = (r: Proc) => { ended = true; if (timer) clearInterval(timer); if (watch) unregisterGroup(p.pid); resolve(idle ? { ...r, idle: true } : r); };
     p.stdout.on("data", (d) => {
       last = Date.now();
       stdout += d;
@@ -365,7 +367,13 @@ export function claudeCwd(): string {
  * `session`: a sandboxed call keeps its session store and reports it in `session.kept` (the caller removes it). With `session.resume` the call continues that session with the message on its account, or returns undefined from `askOnce` when it cannot.
  * `lint`: checks the parsed reply (src/replylint.ts). With problems, and for a sandboxed call of a prompt that registers `lint`, one follow-up message goes to the same session and its reply is linted too.
  */
-export type AskOptions = { check?: CheckTool; lint?: Lint; onProgress?: (line: string) => void; checkout?: string; reference?: string; maxWaitMs?: number; shared?: { name: string; dir: string }[]; session?: SessionAsk; itemTools?: { mounts: { host: string; path: string }[]; mcpServers: Record<string, unknown> } | null };
+export type AskOptions = {
+  check?: CheckTool; lint?: Lint; onProgress?: (line: string) => void; checkout?: string; reference?: string; maxWaitMs?: number; shared?: { name: string; dir: string }[]; session?: SessionAsk; itemTools?: { mounts: { host: string; path: string }[]; mcpServers: Record<string, unknown> } | null;
+  /** The call runs only on this user's own Task Runners (src/remote/calls.ts NewCall.forLogin), never on the server's accounts. */
+  forLogin?: string;
+  /** User-local mode: the longest wait of the first call alone in the queue (WaitLimitError past it); follow-ups on its session wait as `maxWaitMs` says. */
+  firstWaitMs?: number;
+};
 
 /** The repo-docs directory for the item's repository, or undefined (no docs, or a checkout that is not one of ours). */
 async function docsOf(db: Db, checkout: string): Promise<string | undefined> {
@@ -483,6 +491,7 @@ export async function askClaude<K extends ClaudePromptId>(id: K, model: string, 
 
 async function askOnce<K extends ClaudePromptId>(id: K, model: string, input: ClaudeInput[K], db: Db, opts: AskOptions): Promise<LintedReply | null | undefined> {
   if (await inferenceMode(db) === "user-local") return askRemote(id, model, input, db, opts);
+  if (opts.forLogin !== undefined) return null;
   const ses = opts.session;
   const sandboxed = opts.checkout !== undefined && CLAUDE_PROMPTS[id].sandbox !== undefined;
   const reference = sandboxed && CLAUDE_PROMPTS[id].sandbox?.reference ? opts.reference : undefined;
@@ -726,16 +735,17 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
     const level = await levelBand(db, items[0]?.repo, items[0]?.number);
 
     /** One remote turn: the first message, or with `after` a follow-up on the session of that call. The reference folder is named after its repo (referenceDir). */
-    const turn = async (stdin: string, after: number | null, lean = false): Promise<{ reply: Turned; callId: number } | "failed" | "unclaimed"> => {
+    const turn = async (stdin: string, after: number | null, lean = false, first = false): Promise<{ reply: Turned; callId: number } | "failed" | "unclaimed"> => {
+      const maxWaitMs = first && opts.firstWaitMs !== undefined ? Math.min(opts.firstWaitMs, opts.maxWaitMs ?? Infinity) : opts.maxWaitMs;
       const callId = await enqueueCall(db, {
-        promptId: id, promptVersion: promptVersion(id), tier, effort: p.effort, askedModel: model, items, level, maxAttempts: p.limits.attempts, ...(after !== null && { parentId: after }), ...(reference && { referenceRepo: basename(opts.reference!) }),
+        promptId: id, promptVersion: promptVersion(id), tier, effort: p.effort, askedModel: model, items, level, maxAttempts: p.limits.attempts, ...(after !== null && { parentId: after }), ...(reference && { referenceRepo: basename(opts.reference!) }), ...(opts.forLogin !== undefined && { forLogin: opts.forLogin }),
         bundle: {
           promptId: id, promptVersion: promptVersion(id), tier, effort: p.effort, timeoutSeconds, maxTurns: sandboxed ? (lean ? FIX_TURN_MAX_TURNS : p.sandbox!.maxTurns) : null,
           stdin: stdin === parts.stdin ? stdin : stripMarks(stdin), system: parts.system, mounts, mcpServers: servers, keepSession: persist, ...(after !== null && { resume: { parentCallId: after } }),
           hints: { claude: { args: lean ? noToolArgs(args) : args, ...(agents && { agents }) } },
         },
       });
-      const o = await awaitCall(db, callId, { ...(opts.onProgress && { onProgress: opts.onProgress }), ...(opts.maxWaitMs !== undefined && { maxWaitMs: opts.maxWaitMs }), ...(checkTool && { check: checkTool }) });
+      const o = await awaitCall(db, callId, { ...(opts.onProgress && { onProgress: opts.onProgress }), ...(maxWaitMs !== undefined && { maxWaitMs }), ...(checkTool && { check: checkTool }) });
       if (o.state === "unclaimed") return "unclaimed";
       if (o.state === "failed") {
         if (o.runId !== null) await finishRun(db, o.runId, { state: "failed", ...(o.tokens && { tokens: o.tokens }), error: await scrubError(o.error), summary: "failed" });
@@ -753,7 +763,7 @@ async function askRemote<K extends ClaudePromptId>(id: K, model: string, input: 
       return { reply: { text, usage, ...(turns !== undefined && { turns }), ...(ran && { model: ran }), ...(o.sessionId && { sessionId: o.sessionId }) }, callId };
     };
 
-    const first = await turn(resume ? resume.message : parts.stdin, parent);
+    const first = await turn(resume ? resume.message : parts.stdin, parent, false, true);
     // A resume nobody took: the caller asks anew, as when a local session cannot be resumed.
     if (first === "unclaimed") return undefined;
     if (first === "failed") return null;

@@ -2,23 +2,24 @@
 // pipeline switch and the stage limits; only operators request or cancel jobs,
 // flip the switch and change limits. The
 // dashboard never runs a step: it writes job rows that the runner picks up.
+import { mayRunRepo } from "../repo-access.ts";
 import type { Job, JobState, PipelineOverview, PipelineStage, PipelineState, PipelineStep, StepParam } from "../../../web/src/api/types.ts";
-import { enqueue, getJob, jobDetail, JobError, JOB_STATES, listJobs, requestCancel, toJobs } from "../../runner/jobs.ts";
+import { enqueue, getJob, jobDetail, jobRow, JobError, JOB_STATES, listJobs, requestCancel, toJobs } from "../../runner/jobs.ts";
 import { ackDeadline, LimitError, pipelineState as rawPipelineState, resetLimitCount, setEnabled, setLimit } from "../../runner/autopilot.ts";
 import { HEARTBEAT_KEY } from "../../runner/runner.ts";
 import { loadSteps, type StepDef } from "../../runner/steps.ts";
 import { JUDGEMENT_MODELS, judgementModel, setJudgementModel } from "../../decide/judgement.ts";
 import { audit } from "../audit.ts";
 import { outsideState } from "../../outside.ts";
-import { resumeStage, TripError } from "../../push-outcomes.ts";
+import { mayResumeTrip, resumeStage, TripError } from "../../push-outcomes.ts";
 import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { blankIfHidden, hiddenRepos, visibleRepos } from "./visible.ts";
 import { cols } from "../../db/kx.ts";
-import { filtered, hiddenTestExpr, type HiddenRepos } from "../../hidden-sql.ts";
+import { filtered, hiddenTestExpr, isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
 import { isQuiet } from "../../security/quiet.ts";
 import { canSeeInternals } from "./staff.ts";
-import { SECURITY_STEP } from "../../security/rules.ts";
+import { SECURITY_PREFIX, SECURITY_STEP } from "../../security/rules.ts";
 import { mapSeq } from "../../async-seq.ts";
 import type { Db } from "../../db/index.ts";
 import { setting } from "../../settings-read.ts";
@@ -41,10 +42,14 @@ function requireOperator(req: Req, step?: StepDef): void {
   if (req.user.role !== "operator" || (step && step.requires !== "operator")) throw new HttpError(403, "only operators run or cancel pipeline steps and change the pipeline switch and limits");
 }
 
-/** The pipeline state for the requester: reasons that name a hidden repo are left out. */
+/** The pipeline state for the requester: reasons that name a hidden repo and trips on one are left out. */
 async function pipelineState(db: Db, req: Req): Promise<PipelineState> {
   const [s, hidden] = await Promise.all([rawPipelineState(db), hiddenRepos(db, req)]);
-  return { ...s, outside: await outsideState(db, hidden), limits: s.limits.map((l) => ({ ...l, pausedReason: blankIfHidden(l.pausedReason, hidden) || null, status: blankIfHidden(l.status, hidden) || null })) };
+  const limits = await mapSeq(s.limits, async ({ trips, ...l }) => {
+    const shown = await mapSeq((trips ?? []).filter((t) => t.repo === null || !isHiddenRepo(hidden, t.repo)), async (t) => ({ ...t, reason: blankIfHidden(t.reason, hidden), canResume: await mayResumeTrip(req.user, t.key) }));
+    return { ...l, pausedReason: blankIfHidden(l.pausedReason, hidden) || null, status: blankIfHidden(l.status, hidden) || null, ...(shown.length ? { trips: shown } : {}) };
+  });
+  return { ...s, outside: await outsideState(db, hidden), limits };
 }
 
 /** Viewers read that a job failed, not why: the error carries log and command text. */
@@ -155,7 +160,10 @@ const jobId = (req: Req): number => {
 
 export const job = async (db: Db, req: Req) => wrap(async () => {
   const hidden = await hiddenRepos(db, req);
-  const d = await jobDetail(db, jobId(req), { hidden, logs: canSeeInternals(req) });
+  const id = jobId(req);
+  const d = await jobDetail(db, id, { hidden, logs: canSeeInternals(req) });
+  const repo = jobRepo((await jobRow(db, id))?.repo);
+  d.canCancel = req.user.role === "operator" || (!!repo && await mayRunRepo(req.user, repo));
   if (canSeeInternals(req)) return forViewer(req, hidden)(d) as typeof d;
   // An item's outcome reads "failed: <reason>" or carries notes: viewers get the leading state word, and nothing for a quiet pull request.
   const items = await mapSeq(d.items, async (i) => ({ ...i, outcome: await isQuiet(db, i.repo, i.number) ? null : /^[A-Za-z-]+/.exec(i.outcome ?? "")?.[0] ?? null }));
@@ -180,12 +188,16 @@ export async function request(db: Db, req: Req): Promise<Job> {
   return j;
 }
 
+/** A security job stores its repo as `(security):<repo>`; the permission is on the repo itself. */
+const jobRepo = (r: string | null | undefined): string | null => (r?.startsWith(SECURITY_PREFIX) ? r.slice(SECURITY_PREFIX.length) : r ?? null);
+
+// An operator cancels any job; a maintainer with write access cancels the jobs of that repo. A job without a repo stays operator-only.
 export async function cancel(db: Db, req: Req): Promise<Job> {
-  requireOperator(req);
+  if (req.user.role === "viewer") throw new HttpError(403, "only operators and maintainers cancel pipeline jobs");
   const id = jobId(req);
   const before = await wrap(async () => await getJob(db, id));
-  const step = (await loadSteps()).get(before.step);
-  if (step) requireOperator(req, step);
+  const repo = jobRepo((await jobRow(db, id))?.repo);
+  if (req.user.role !== "operator" && !(repo && await mayRunRepo(req.user, repo))) throw new HttpError(403, "only an operator, or a maintainer with write access to the job's repo, cancels it");
   const j = await wrap(async () => await requestCancel(db, id, req.user.login));
   await audit(db, req.user.login, "job-cancel", `job:${id}`, { step: j.step, state: before.state });
   return j;
@@ -227,9 +239,9 @@ export async function putLimit(db: Db, req: Req) {
   return (await pipelineState(db, req)).limits.find((l) => l.step === req.params.step)!;
 }
 
-/** An operator clears a stage the circuit breaker paused. */
+/** An operator, or a maintainer with write access to the trip's repo, clears a breaker (`<stage>:<repo>`, or outside-surge). */
 export async function resumeTrip(db: Db, req: Req) {
-  requireOperator(req);
+  if (!await mayResumeTrip(req.user, req.params.stage!)) throw new HttpError(403, "only an operator, or a maintainer with write access to the breaker's repo, resumes it");
   try {
     await resumeStage(db, req.params.stage, req.user.login);
   } catch (e) {

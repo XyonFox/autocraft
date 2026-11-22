@@ -4,9 +4,13 @@
 // No Node imports: the helper keeps its own copy of these shapes and the dashboard build may import this file.
 
 /** Bumped on any change to these shapes; the server refuses a claim from a helper of a version outside ACCEPTED_PROTOCOLS. */
-export const PROTOCOL_VERSION = 4;
-/** The protocol versions the server answers. 3 is a helper without long-polling claims (no `Claim.wait`); its claims are answered at once. */
-export const ACCEPTED_PROTOCOLS: readonly number[] = [3, 4];
+export const PROTOCOL_VERSION = 5;
+/**
+ * The protocol versions the server answers. 3 is a helper without long-polling claims (no `Claim.wait`); its claims are
+ * answered at once. 4 is a helper that reads only the text of a `ToolReply`; `autocraft tool` of such a helper prints no
+ * image (a harness on MCP reads the server's replies itself, whatever the helper's version).
+ */
+export const ACCEPTED_PROTOCOLS: readonly number[] = [3, 4, 5];
 
 /**
  * API routes on the dashboard origin. Runner routes take `Authorization: Bearer <Task Runner credential>` (an MCP Connector
@@ -27,9 +31,9 @@ export const ROUTES = {
   release: "/api/remote/release",
   /** Lease secret. A private repo's checkout or a workspace entry as a tar stream: `?repo=<name>&sha=<sha>`. */
   tarball: "/api/remote/tarball",
-  /** Lease secret. One tool call of a server the bundle lists, without MCP: `POST ${tool}/<server>/<tool>`, body the tool's arguments, reply `ToolReply`. A long call (the `check` tool) sends whitespace before the JSON while it runs. */
+  /** Lease secret. One tool call of a server the bundle lists, without MCP: `POST ${tool}/<server>/<tool>`, body the tool's arguments, reply `ToolReply`. A long call (`check`, the workspace tools) sends whitespace before the JSON while it runs. */
   tool: "/api/remote/tool",
-  /** Lease secret. Streamable HTTP MCP servers with only this call's tools, one per server name: `/mcp/task/<name>` (items, build, reference). */
+  /** Lease secret. Streamable HTTP MCP servers with only this call's tools, one per server name: `/mcp/task/<name>` (items, build, reference, workspace). */
   mcp: "/mcp/task",
   /** No credential. Body `LoginStart`, reply `LoginStartReply`: a Task Runner asks to have the credential it made approved by a signed-in user. */
   loginStart: "/api/remote/login/start",
@@ -76,6 +80,13 @@ export type Claim = {
   /** The claim comes from the helper's fast-lane slot: the server offers it only follow-ups of its sessions, gating calls and small-tier calls. */
   fastLane?: boolean;
   /**
+   * The claim comes from the helper's own lane, beside its slots: the server offers it only calls bound to the helper's user (a
+   * maintainer's own conversation turn) and their follow-ups, which count toward no slot or Max calls at once.
+   */
+  ownLane?: boolean;
+  /** A claim from a slot or the fast lane of a helper that also runs an own lane: the calls bound to its user are left to that lane. */
+  withOwnLane?: boolean;
+  /**
    * Protocol 4 only: how long the server may hold the claim open when nothing is queued for it, in whole seconds (0 to 30).
    * A call queued meanwhile is leased at once; when none comes, the empty reply has `retryAfter: 1`. Absent or 0: answered at once.
    */
@@ -102,8 +113,8 @@ export type Encoding = (typeof ENCODINGS)[number];
 export type Envelope = { encoding: Encoding; body: string };
 
 export type ClaimReply =
-  | { lease: null; /** Seconds to wait before the next claim when nothing is queued. */ retryAfter: number; reserve: Reserve; /** Present while the token gets no calls: why (repeated lost leases, the user's limit of calls at once), and with a cool-off when it may claim again (ms since epoch). `retryAfter` then runs to `until`. */ reason?: string; until?: number; /** The body encodings the server accepts (ENCODINGS); absent from a server that takes plain JSON only. */ encodings?: Encoding[] }
-  | { lease: { id: number; secret: string; /** One line: prompt id and the item, e.g. "review.opus on designcraft#1502". */ title: string; requiredHelper: string }; reserve: Reserve; encodings?: Encoding[] };
+  | { lease: null; /** Seconds to wait before the next claim when nothing is queued. */ retryAfter: number; reserve: Reserve; /** Present while the token gets no calls: why (repeated lost leases, the user's limit of calls at once), and with a cool-off when it may claim again (ms since epoch). `retryAfter` then runs to `until`. */ reason?: string; until?: number; /** The body encodings the server accepts (ENCODINGS); absent from a server that takes plain JSON only. */ encodings?: Encoding[]; /** The server answered the claim's `ownLane`; a server without it ignores the field and leaves this out. */ ownLane?: true }
+  | { lease: { id: number; secret: string; /** One line: prompt id and the item, e.g. "review.opus on designcraft#1502". */ title: string; requiredHelper: string }; reserve: Reserve; encodings?: Encoding[]; ownLane?: true };
 
 /**
  * Whether a helper takes calls now. `ready`: it claims. `quota-held`: a plan window is at or below the reserve, its usage
@@ -269,7 +280,13 @@ export type Submit =
 export type SubmitReply = { accepted: boolean; reason?: string };
 
 /** A tool's result, as an MCP tools/call result carries it. */
-export type ToolReply = { content: { type: "text"; text: string }[]; isError?: boolean };
+/** One entry of a tool reply's content. Protocol 5: a tool result's images (base64) follow its text. */
+export type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+export type ToolReply = { content: ToolContent[]; isError?: boolean };
+
+/** The content of a tool result, as a ToolReply and an MCP tools/call reply carry it: the text, then the images. */
+export const toolContent = (r: { text: string; images?: readonly { data: string; mimeType: string }[] }): ToolContent[] =>
+  [{ type: "text", text: r.text }, ...(r.images ?? []).map((i): ToolContent => ({ type: "image", data: i.data, mimeType: i.mimeType }))];
 
 export type Release = { /** Why the helper gives the lease back, shown on the call. */ reason: string };
 

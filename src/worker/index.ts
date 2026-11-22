@@ -17,7 +17,7 @@ const USAGE = `usage: autocraft-server worker serve [--config FILE]   (default: 
        autocraft-server worker store keygen --private FILE --public FILE
        autocraft-server worker update-code --sha SHA --ssh USER@HOST --key FILE --git-dir BARE_REPO
        autocraft-server worker status
-       autocraft-server worker pod task|source|upload|disk   (inside a build pod the runner started)`;
+       autocraft-server worker pod task|source|upload|disk|warm-restore|warm-publish|warm-gc   (inside a build pod the runner started)`;
 
 /** Updates the sandbox worker now, or records the update when its tasks are still running. */
 async function updateCode(args: string[]): Promise<void> {

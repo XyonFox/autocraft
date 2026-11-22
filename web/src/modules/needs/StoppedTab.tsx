@@ -20,7 +20,7 @@ function Resume({ row, onDone }: { row: NeedsStoppedRow; onDone: () => void }) {
   const r = row.resume;
   if (r.type === "fixes" || r.type === "outside") return null;
   if (r.type === "link") return <TextLink to={r.to}>Open</TextLink>;
-  if (!operator) return null;
+  if (r.type === "trip" ? !r.canResume : !operator) return null;
   if (r.type === "retry") {
     return (
       <div className="flex flex-col items-end gap-1">
@@ -31,7 +31,7 @@ function Resume({ row, onDone }: { row: NeedsStoppedRow; onDone: () => void }) {
   }
   return (
     <div className="flex flex-col items-end gap-1">
-      <ConfirmButton idle="secondary" label="Resume" confirmLabel="Confirm resume" loading={write.busy === "resume"} onConfirm={() => void write.run("resume", async () => { await api.pipeline.resumeTrip(r.stage); onDone(); })} />
+      <ConfirmButton idle="secondary" label="Resume" confirmLabel="Confirm resume" target={row.repo ? `${row.title} in ${row.repo}` : row.title} loading={write.busy === "resume"} onConfirm={() => void write.run("resume", async () => { await api.pipeline.resumeTrip(r.stage); onDone(); })} />
       <ErrorLine error={write.error} />
     </div>
   );

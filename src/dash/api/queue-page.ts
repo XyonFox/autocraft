@@ -19,6 +19,7 @@ import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { toBatch, toRow } from "./queue.ts";
 import { needVisible, visibleRepos } from "./visible.ts";
+import { mayRunRepo } from "../repo-access.ts";
 import { readerOf, statusFor, veiledFor, type Reader } from "./reader.ts";
 import { stageById } from "../../stages/registry.ts";
 import { flatMapSeq } from "../../async-seq.ts";
@@ -284,6 +285,11 @@ function item(req: Req): { repo: string; number: number } {
 }
 
 /** Runs a library call, turning its errors into HTTP ones. */
+/** Fast track, hold and the batch controls are for whoever runs the repo (src/dash/repo-access.ts). */
+async function needRunner(req: Req, repo: string): Promise<void> {
+  if (!(await mayRunRepo(req.user, repo))) throw new HttpError(403, "no write access to this repo");
+}
+
 async function guarded<T>(f: () => Promise<Promise<T> | T>): Promise<T> {
   try {
     return await f();
@@ -296,6 +302,7 @@ async function guarded<T>(f: () => Promise<Promise<T> | T>): Promise<T> {
 export async function fastTrackAdd(db: Db, req: Req): Promise<string[]> {
   const r = item(req);
   await needVisible(db, req, r.repo);
+  await needRunner(req, r.repo);
   await guarded(async () => await addFastTrack(db, req.user.login, `${r.repo}#${r.number}`));
   return fastTrackRefs(db, req);
 }
@@ -320,6 +327,7 @@ export async function fastTrackWeight(db: Db, req: Req): Promise<string[]> {
   const r = item(req);
   const w = weightOf(req);
   await needVisible(db, req, r.repo);
+  await needRunner(req, r.repo);
   await guarded(async () => await setFastTrackWeight(db, req.user.login, `${r.repo}#${r.number}`, w));
   return fastTrackRefs(db, req);
 }
@@ -359,7 +367,7 @@ async function openClosingIndex(db: Db, repo?: string): Promise<Map<string, numb
 }
 
 /** The planner's next steps of an issue whose PR Fix is building (src/core/decide-item.ts nextStep). */
-const FIX_BUILDS = new Set(["Fix", "Fix: in progress"]);
+const FIX_BUILDS = new Set(["Implement", "Implement: planning", "Implement: in progress"]);
 
 /** Queue states the Merge board puts in no group unless the PR has a merge hold (web/src/modules/queue/MergeBoard.tsx: neither a step nor stopped). */
 const UNSHOWN_STATES = new Set<string>(["declined", "held-duplicate", "held-backlog", "merged"]);
@@ -423,6 +431,7 @@ export async function queueAdd(db: Db, req: Req, via?: string, pin?: (pr: number
 export async function fastTrackRemove(db: Db, req: Req): Promise<string[]> {
   const r = item(req);
   await needVisible(db, req, r.repo);
+  await needRunner(req, r.repo);
   await guarded(async () => await removeFastTrack(db, req.user.login, `${r.repo}#${r.number}`));
   return fastTrackRefs(db, req);
 }
@@ -430,6 +439,7 @@ export async function fastTrackRemove(db: Db, req: Req): Promise<string[]> {
 export async function mergeHoldPr(db: Db, req: Req, on: boolean): Promise<{ ok: true }> {
   const r = item(req);
   await needVisible(db, req, r.repo);
+  await needRunner(req, r.repo);
   const changed = await guarded(async () => (on ? await holdMerge(db, req.user.login, r.repo, r.number) : await releaseMerge(db, req.user.login, r.repo, r.number)));
   if (!changed) throw new HttpError(409, `${r.repo}#${r.number} is ${on ? "already" : "not"} held`);
   return { ok: true };
@@ -438,6 +448,7 @@ export async function mergeHoldPr(db: Db, req: Req, on: boolean): Promise<{ ok: 
 export async function batchRemovePr(db: Db, req: Req, run?: Exec): Promise<{ batch: string; closed: number | null }> {
   const r = item(req);
   await needVisible(db, req, r.repo);
+  await needRunner(req, r.repo);
   return guarded(async () => removeFromBatch(db, req.user.login, r.repo, r.number, run));
 }
 
@@ -446,5 +457,6 @@ export async function batchStop(db: Db, req: Req, run?: Exec): Promise<{ batch: 
   const repo = Number.isInteger(id) ? (await db.get(db.k.selectFrom("main.merge_batches").select("repo").where("id", "=", id)))?.repo : undefined;
   if (!repo) throw new HttpError(404, `no batch ${req.params.id}`);
   await needVisible(db, req, repo);
+  await needRunner(req, repo);
   return guarded(async () => stopBatch(db, req.user.login, id, run));
 }

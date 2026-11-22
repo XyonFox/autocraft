@@ -11,7 +11,7 @@ import { sweepStaleAnswers } from "../src/answers/sweep.ts";
 import { decisionStamp } from "../src/conversations/cards.ts";
 import { doCard } from "../src/conversations/act.ts";
 import { actionable, ask, getDecision } from "../src/decisions.ts";
-import { applyAnswer, canUndo } from "../src/dash/api/decisions.ts";
+import { applyAnswer, canUndo, keepAnswer, retry, undo } from "../src/dash/api/decisions.ts";
 import type { Db } from "../src/db/index.ts";
 import { connectDb } from "../src/db/open.ts";
 
@@ -135,5 +135,19 @@ describe("one answer per question", () => {
     assert.equal(await sweepStaleAnswers(db, T0, "app"), 1);
     const d = (await getDecision(db, "app#1:scope"))!;
     assert.deepEqual({ applied: !!d.applied_at, note: d.answer_note }, { applied: true, note: "not applied: the item is closed" });
+  });
+
+  test("a maintainer who disputed another settler's answer cannot undo, keep or retry it", async () => {
+    const db = await fresh();
+    await db.run(db.k.insertInto("tracked_repos").values({ name: "app", added_by: "op", added_at: T0, pipeline: 1 }));
+    await db.run(db.k.insertInto("access").values([{ login: "a", role: "maintainer" }, { login: "b", role: "maintainer" }]));
+    await db.run(db.k.insertInto("settings").values([{ key: "maintainer_writes", value: "1" }, { key: "github_identity", value: "app" }]));
+    await db.run(db.k.updateTable("decisions").set({ answer: "close", answered_by: "a", answered_at: T0, exec_state: "disputed", dispute_by: "b", dispute_reason: "no" }).where("id", "=", "app#1:scope"));
+    const as = (login: string) => ({
+      method: "POST", path: "", params: { id: "app#1:scope" }, query: new URLSearchParams(), form: new URLSearchParams(), csrf: "", nonce: "",
+      user: { login, role: "maintainer", canWrite: async () => true, canRead: async () => true },
+    }) as never;
+    for (const f of [undo, keepAnswer, retry]) await assert.rejects(f(db, as("b")), { status: 403 });
+    assert.equal((await getDecision(db, "app#1:scope"))!.answer, "close");
   });
 });

@@ -42,13 +42,18 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
-export const HELPER_VERSION = "1.3.5";
+export const HELPER_VERSION = "1.3.8";
 
 // ---------------------------------------------------------------------------
 // Wire format: a copy of src/remote/protocol.ts (the helper is served alone, so it keeps its own).
 
-/** The server refuses a claim of a protocol it does not accept; a server that knows only 3 is asked again with 3 (claimProtocol). */
-export const PROTOCOL_VERSION = 4;
+/**
+ * The server refuses a claim of a protocol it does not accept; a server not yet updated is asked again with the older
+ * protocols (claimRequest). 5: a tool reply's content may hold images after the text.
+ */
+export const PROTOCOL_VERSION = 5;
+/** The protocols a claim falls back to, newest first: 4 and 3 differ from 5 only in what the server sends, 3 also has no held wait. */
+const OLDER_PROTOCOLS = [4, 3];
 
 export const ROUTES = {
   claim: "/api/remote/claim",
@@ -81,6 +86,8 @@ export const ROUTES = {
  * @property {string} [root]
  * @property {string} requestId
  * @property {boolean} [fastLane]
+ * @property {boolean} [ownLane]  the own lane: only calls bound to this user and their follow-ups
+ * @property {boolean} [withOwnLane]  a slot's or the fast lane's claim while an own lane runs beside them
  * @property {number} [wait]  protocol 4: seconds the server may hold the claim open when nothing is queued (0 to 30)
  */
 /** @typedef {{ fiveHour: number, weekly: number }} Reserve  percent of each plan window kept free */
@@ -88,7 +95,7 @@ export const ROUTES = {
 export const ENCODINGS = /** @type {const} */ (["gzip+base64"]);
 /** @typedef {(typeof ENCODINGS)[number]} Encoding */
 /** @typedef {{ encoding: Encoding, body: string }} Envelope  `body`: base64 of the gzip of the plain JSON body */
-/** @typedef {{ lease: null, retryAfter: number, reserve: Reserve, reason?: string, until?: number, encodings?: Encoding[] } | { lease: { id: number, secret: string, title: string, requiredHelper: string }, reserve: Reserve, encodings?: Encoding[] }} ClaimReply */
+/** @typedef {{ lease: null, retryAfter: number, reserve: Reserve, reason?: string, until?: number, encodings?: Encoding[], ownLane?: true } | { lease: { id: number, secret: string, title: string, requiredHelper: string }, reserve: Reserve, encodings?: Encoding[], ownLane?: true }} ClaimReply */
 /** @typedef {"ready" | "quota-held" | "paused" | "cooled-off" | "sandbox-failed" | "version-refused" | "harness-missing" | "failing"} Readiness */
 /** @typedef {{ usedPercent: number, resetsAt: string | null }} UsageWindow */
 /** @typedef {{ fiveHour: UsageWindow | null, weekly: UsageWindow | null, at: string }} UsageReading */
@@ -219,7 +226,7 @@ const HEARTBEAT_MS = scaled(HEARTBEAT_S * 1000), PREPARE_MAX_MS = scaled(PREPARE
  * @property {boolean} [exclusive]  one call at a time per helper (the harness refreshes a shared login)
  * @property {boolean} [fileTools]  the run gets the helper's read-only file tools (its own read tool can't be confined)
  * @property {(version: string) => string | null} [unaudited]  why this harness version must not run calls, or null
- * @property {(line: string, servers: string[]) => string | null} [guard]  an output line showing a tool the call may not use: the run is stopped at once
+ * @property {(line: string, servers: string[]) => string | null} [guard]  an output line showing a tool the call may not use, or that one of its MCP servers is missing: the run is stopped at once
  * @property {(o: { token: string, sessionId: string | undefined, servers: string[], keep: boolean }) => { problem: string | null, tools?: SubmitTool[] }} [verify]  after the run, from the harness's own record: a tool the call may not use (or null), and the tool uses
  * @property {(stdout: string, stamps: string[]) => SubmitTool[]} [tools]  the tool uses from the output; `stamps` holds the arrival time of each complete output line
  * @property {(line: string) => string | null} compact  the part of one output line that `parse` and `tools` read, or null: the run keeps only these
@@ -623,6 +630,27 @@ function resolveClaudeBin(cfg) {
   return null;
 }
 
+/** MCP server states of Claude Code's init event under which the server's tools are, or will be, there. */
+const CLAUDE_MCP_UP = new Set(["connected", "pending"]);
+
+/**
+ * A `claude` stream-json init event that lacks one of the call's MCP servers: the reason, or null. Claude Code drops a
+ * server it cannot load (a reserved name, a failed connection) and runs on without its tools, so the run is stopped here
+ * rather than left to answer without them.
+ * @param {string} raw @param {string[]} servers
+ */
+export function claudeMcpProblem(raw, servers) {
+  if (!servers.length || !raw.startsWith('{"type":"system"')) return null;
+  let e;
+  try { e = JSON.parse(raw); } catch { return null; }
+  if (e?.type !== "system" || e.subtype !== "init" || !Array.isArray(e.mcp_servers)) return null;
+  for (const n of servers) {
+    const status = e.mcp_servers.find((/** @type {any} */ m) => m?.name === n)?.status;
+    if (!CLAUDE_MCP_UP.has(status)) return `the harness has no ${n} tools: MCP server ${n} ${typeof status === "string" ? clean(status, 30) : "was not loaded"}`;
+  }
+  return null;
+}
+
 /** @param {string[]} args @param {string} sessionId */
 const claudeResume = (args, sessionId) => [...withoutResume(args), "--resume", sessionId];
 
@@ -662,6 +690,7 @@ const claudeAdapter = {
     return claudeSandbox({ claudeBin: t.bin, oauthToken: t.token, claudeArgs: args, mounts: t.mounts, agentsFile, mcpFile: t.mcpFile || undefined, sessionDir: t.sessionDir });
   },
   parse: parseClaudeOutput,
+  guard: claudeMcpProblem,
   tools: claudeTools,
   compact: claudeCompact,
   resume: (args, sessionId) => claudeResume(args, sessionId),
@@ -1935,6 +1964,25 @@ export function transient(e, signal) {
   return x.name === "TimeoutError" || NET_CODES.has(x.code ?? "") || NET_CODES.has(x.cause?.code ?? "");
 }
 
+/** Servers whose tool calls run commands and writes that must not run twice: a request that may have reached the server is not sent again. */
+const ONCE_SERVERS = new Set(["work"]);
+/** Codes of a connection that was never made, so the request reached nobody. */
+const UNSENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "ENETDOWN", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
+
+/**
+ * Whether a failed request certainly did not run on the server: refused for the rate (429, answered before the body is
+ * read) or never connected.
+ * @param {unknown} e
+ */
+export function notRun(e) {
+  if (e instanceof HttpError) return e.status === 429;
+  const x = /** @type {{ code?: string, cause?: { code?: string } } | null} */ (e && typeof e === "object" ? e : null);
+  return UNSENT_CODES.has(x?.code ?? "") || UNSENT_CODES.has(x?.cause?.code ?? "");
+}
+
+/** The error for a cut-off call of a ONCE_SERVERS server. @param {unknown} e */
+const mayHaveRun = (e) => new Error(`${msg(e)}; the call may have run in the workspace and is not sent again: look with shell_status or read before you repeat it`);
+
 /** The wait before retry `attempt` (0 first): exponential from `baseMs` up to 30 s with jitter, at least the server's Retry-After. @param {number} attempt @param {number | null} retryAfter */
 export function backoffMs(attempt, retryAfter, baseMs = scaled(1000)) {
   const exp = Math.min(scaled(30_000), baseMs * 2 ** attempt);
@@ -1943,16 +1991,16 @@ export function backoffMs(attempt, retryAfter, baseMs = scaled(1000)) {
 }
 
 /**
- * Runs `fn` until it succeeds, fails for good (`transient` says no) or runs out of time (`deadline`, ms since epoch) or of
- * `tries`; then throws its last error. `signal` ends the waits between tries.
- * @template T @param {() => Promise<T>} fn @param {{ deadline: number, tries?: number, signal?: AbortSignal, baseMs?: number }} o
+ * Runs `fn` until it succeeds, fails for good (`transient` says no, or `again` when given) or runs out of time (`deadline`,
+ * ms since epoch) or of `tries`; then throws its last error. `signal` ends the waits between tries.
+ * @template T @param {() => Promise<T>} fn @param {{ deadline: number, tries?: number, signal?: AbortSignal, baseMs?: number, again?: (e: unknown) => boolean }} o
  * @returns {Promise<T>}
  */
 export async function withRetry(fn, o) {
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (e) {
-      if (!transient(e, o.signal) || (o.tries !== undefined && attempt + 1 >= o.tries)) throw e;
+      if (!transient(e, o.signal) || (o.again && !o.again(e)) || (o.tries !== undefined && attempt + 1 >= o.tries)) throw e;
       const wait = backoffMs(attempt, e instanceof HttpError ? e.retryAfterMs : null, o.baseMs);
       if (Date.now() + wait >= o.deadline) throw e;
       try { await sleep(wait, undefined, o.signal && { signal: o.signal }); } catch { throw e; }
@@ -2848,14 +2896,15 @@ const newClaimId = () => randomBytes(16).toString("hex");
 
 /** Seconds a protocol 4 claim lets the server hold it open while nothing is queued (Claim.wait). */
 export const CLAIM_WAIT_S = 25;
-/** How long a server that refused protocol 4 is asked with protocol 3 before 4 is tried again. */
+/** How long a server that refused the current protocol is asked with an older one before the current one is tried again. */
 const PROTOCOL_FALLBACK_MS = 3600_000;
-/** Until when claims use protocol 3: the server answered 409 to protocol 4 and accepted 3 (a server not yet updated). */
-let protocol3Until = 0;
+/** The older protocol the server accepted after it answered 409 to the current one (a server not yet updated), and until when claims use it. */
+let fallback = { protocol: PROTOCOL_VERSION, until: 0 };
 
 /**
- * Sends a claim: with protocol 4 and a held wait, or with protocol 3 while the server refused 4. A 409 to protocol 4 is
- * asked again at once with protocol 3; only a 409 to that is a refusal of this runner.
+ * Sends a claim: with the current protocol, or with the older one the server accepted while it refuses the current one.
+ * A 409 is asked again at once with each older protocol in turn (a held wait from 4 on); only a 409 to the oldest is a
+ * refusal of this runner.
  * `signal` (a `work` stopping) ends a held claim.
  * @param {string} server @param {string} token @param {Omit<Claim, "protocol" | "wait">} base @param {AbortSignal} [signal] @returns {Promise<ClaimReply>}
  */
@@ -2867,13 +2916,16 @@ export async function claimRequest(server, token, base, signal) {
     // Retries resend the same request id, so a claim whose reply was lost gets its lease back instead of leaving it to expire.
     return withRetry(() => api(server, ROUTES.claim, token, claim, { timeoutMs: scaled(hold * 1000) + 30_000, ...(signal && { signal }) }), { tries: 5, deadline: Date.now() + scaled(hold * 1000) + Math.min(scaled(60_000), CLAIM_ID_TTL_MS / 2), ...(signal && { signal }) });
   };
-  if (Date.now() < protocol3Until) return send(3);
-  try { return await send(PROTOCOL_VERSION); }
-  catch (e) {
-    if (!(e instanceof HttpError && e.status === 409)) throw e;
-    const reply = await send(3);
-    protocol3Until = Date.now() + PROTOCOL_FALLBACK_MS;
-    return reply;
+  if (Date.now() < fallback.until) return send(fallback.protocol);
+  const tries = [PROTOCOL_VERSION, ...OLDER_PROTOCOLS];
+  for (let i = 0; ; i++) {
+    try {
+      const reply = await send(tries[i]);
+      if (i > 0) fallback = { protocol: tries[i], until: Date.now() + PROTOCOL_FALLBACK_MS };
+      return reply;
+    } catch (e) {
+      if (!(e instanceof HttpError && e.status === 409) || i === tries.length - 1) throw e;
+    }
   }
 }
 
@@ -2881,11 +2933,11 @@ export async function claimRequest(server, token, base, signal) {
  * Claims one call when the helper is ready (checkReady); otherwise claims nothing and says why (`held`). On macOS the claim
  * names the path root of slot `slot` (a free one when not given), which the lease keeps, and offers only that slot's sessions.
  * A lease that comes back with a higher reserve than the one checked, which the usage no longer allows, is released.
- * `fastLane`: the claim comes from the fast-lane slot (Claim.fastLane). `requestId`: a caller whose last claim failed in
- * transit passes that claim's id again, so the server answers with the lease it may have taken.
- * @param {Config} cfg @param {number} [slot] @param {boolean} [fastLane] @param {string} [requestId] @param {AbortSignal} [signal] @returns {Promise<ClaimReply | { held: Ready }>}
+ * `fastLane`: the claim comes from the fast-lane slot (Claim.fastLane); `ownLane`: from the own lane (Claim.ownLane). `requestId`:
+ * a caller whose last claim failed in transit passes that claim's id again, so the server answers with the lease it may have taken.
+ * @param {Config} cfg @param {number} [slot] @param {boolean} [fastLane] @param {string} [requestId] @param {AbortSignal} [signal] @param {boolean} [ownLane] @param {boolean} [withOwnLane] @returns {Promise<ClaimReply | { held: Ready }>}
  */
-async function claimOnce(cfg, slot, fastLane = false, requestId = newClaimId(), signal = undefined) {
+async function claimOnce(cfg, slot, fastLane = false, requestId = newClaimId(), signal = undefined, ownLane = false, withOwnLane = false) {
   const { server, agentToken } = needLogin(cfg);
   const ready = await checkReady(cfg);
   const cooled = ready.readiness === "cooled-off" && ready.quotaReady === true;
@@ -2894,7 +2946,7 @@ async function claimOnce(cfg, slot, fastLane = false, requestId = newClaimId(), 
   const mac = process.platform === "darwin";
   const n = mac ? slot ?? pickSlot(slotBase()) : undefined;
   const root = n === undefined ? undefined : slotRoot(slotBase(), n);
-  const claim = { requestId, helperVersion: HELPER_VERSION, harness: adapter.id, harnessVersion: d.version, tiers, efforts: Object.fromEntries(Object.keys(tiers).map((t) => [t, adapter.maxEffort])), ...(cfg.repos && { repos: cfg.repos }), sessions: heldSessions(n), ...(root && { root }), ...(fastLane && { fastLane: true }) };
+  const claim = { requestId, helperVersion: HELPER_VERSION, harness: adapter.id, harnessVersion: d.version, tiers, efforts: Object.fromEntries(Object.keys(tiers).map((t) => [t, adapter.maxEffort])), ...(cfg.repos && { repos: cfg.repos }), sessions: heldSessions(n), ...(root && { root }), ...(fastLane && { fastLane: true }), ...(ownLane && { ownLane: true }), ...(withOwnLane && !ownLane && { withOwnLane: true }) };
   /** @type {ClaimReply} */
   let reply;
   try {
@@ -3637,6 +3689,12 @@ async function cmdWork(argv) {
   // One more slot beside the N that takes only short calls and the follow-ups of this helper's sessions, so a lint check or a
   // fix turn never waits for a long run to end. Not for a harness that runs one call at a time, nor past the macOS slots.
   const fast = !exclusive.exclusive && !(process.platform === "darwin" && n >= MAC_MAX_SLOTS);
+  // And one beside them that takes only calls bound to this user (their own conversation turns and those calls' follow-ups),
+  // which the server counts toward no slot: they run while the slots are busy. Not for a harness that runs one call at a time,
+  // nor past the macOS slots. It is not reported as a slot.
+  const own = !exclusive.exclusive && !(process.platform === "darwin" && n + (fast ? 1 : 0) >= MAC_MAX_SLOTS);
+  // Whether the own lane runs: the slots then leave the bound calls to it (Claim.withOwnLane). It stops against a server without it.
+  let ownLaneOn = own;
   const ac = new AbortController();
   for (const sig of STOP_SIGNALS) {
     process.on(sig, () => {
@@ -3660,20 +3718,20 @@ async function cmdWork(argv) {
     heldSaid = heldLine({ readiness, reason, until });
     console.log(`not claiming: ${heldSaid}; running calls finish`);
   };
-  /** @param {boolean} fastLane */
-  const loop = async (fastLane) => {
+  /** @param {boolean} fastLane @param {boolean} [ownLane] */
+  const loop = async (fastLane, ownLane = false) => {
     // macOS: each loop holds one slot for its lifetime, so its claims name that slot's root and sessions.
     const held = process.platform === "darwin" ? holdSlot(slotBase()) : null;
-    try { await claimLoop(held?.n, fastLane); } finally { held?.release(); }
+    try { await claimLoop(held?.n, fastLane, ownLane); } finally { held?.release(); }
   };
-  /** @param {number | undefined} slot @param {boolean} fastLane */
-  const claimLoop = async (slot, fastLane) => {
+  /** @param {number | undefined} slot @param {boolean} fastLane @param {boolean} ownLane */
+  const claimLoop = async (slot, fastLane, ownLane) => {
     let claimId = newClaimId();
     let blockedRun = 0;
     while (!ac.signal.aborted) {
       if (Date.now() < notBefore) { await pause(notBefore - Date.now()); continue; }
       let r;
-      try { r = await claimOnce(loadConfig(), slot, fastLane, claimId, ac.signal); claimId = newClaimId(); blockedRun = 0; } catch (e) {
+      try { r = await claimOnce(loadConfig(), slot, fastLane, claimId, ac.signal, ownLane, ownLaneOn); claimId = newClaimId(); blockedRun = 0; } catch (e) {
         if (ac.signal.aborted) break;
         // A claim lost in transit may have leased a call: the next try sends the same id and gets that lease back.
         if (!transient(e)) claimId = newClaimId();
@@ -3698,18 +3756,26 @@ async function cmdWork(argv) {
         continue;
       }
       if (heldSaid) { console.log("ready again"); heldSaid = ""; }
+      // A server older than the own lane ignores the field and offers any call: the lane runs what it got and then stops.
+      const ownLaneUnknown = ownLane && r.ownLane !== true;
+      if (ownLaneUnknown) ownLaneOn = false;
+      if (ownLaneUnknown && !r.lease) { console.log("the server has no own lane for calls bound to you; that lane stops"); return; }
       if (!r.lease) {
+        // The own lane waits quietly: the slots' loops say what the helper is doing.
+        if (ownLane) { await pause(Math.max(TIME_SCALE, r.retryAfter) * 1000); continue; }
         const say = r.reason ? `no calls for this helper: ${r.reason}${r.until ? ` (until ${new Date(r.until).toLocaleString()})` : ""}` : `no task queued; claiming again in ${r.retryAfter} s`;
         if (idleSaid !== say) { console.log(say); idleSaid = say; }
         await pause(Math.max(TIME_SCALE, r.retryAfter) * 1000);
         continue;
       }
       idleSaid = "";
-      console.log(`lease ${r.lease.id}${fastLane ? " (fast lane)" : ""}: ${r.lease.title}`);
-      capacity.busy++;
+      console.log(`lease ${r.lease.id}${fastLane ? " (fast lane)" : ownLane ? " (own lane)" : ""}: ${r.lease.title}`);
+      const counted = !ownLane;
+      if (counted) capacity.busy++;
       let s;
-      try { s = await runLease(loadConfig(), r.lease.id, { signal: ac.signal, slotHeld: slot !== undefined }); } finally { capacity.busy--; }
+      try { s = await runLease(loadConfig(), r.lease.id, { signal: ac.signal, slotHeld: slot !== undefined }); } finally { if (counted) capacity.busy--; }
       console.log(s.line);
+      if (ownLaneUnknown) { console.log("the server has no own lane for calls bound to you; that lane stops"); return; }
       if (s.hold) hold(s.hold.readiness, s.line, s.hold.ms === null ? null : Date.now() + s.hold.ms);
       else if (s.state === "submitted") {
         if (failures >= FAILURES_TO_HOLD) clearHold("failing");
@@ -3725,7 +3791,7 @@ async function cmdWork(argv) {
       }
     }
   };
-  await Promise.all([...Array.from({ length: n }, () => loop(false)), ...(fast ? [loop(true)] : [])]);
+  await Promise.all([...Array.from({ length: n }, () => loop(false)), ...(fast ? [loop(true)] : []), ...(own ? [loop(false, true)] : [])]);
   return 0;
 }
 
@@ -4182,6 +4248,8 @@ async function cmdMcp(argv) {
   const forward = async (line) => {
     let m;
     try { m = JSON.parse(line); } catch { return; }
+    // A tool call of a server whose calls must not run twice is sent again only when it certainly did not run.
+    const once = ONCE_SERVERS.has(name) && m?.method === "tools/call";
     try {
       // Retried until the server answers with a status that is not transient; a reply's body, once read, is not.
       const res = await withRetry(async () => {
@@ -4189,7 +4257,7 @@ async function cmdMcp(argv) {
         if (res.status === 410) throw new Gone("the lease is gone");
         if (!res.ok && res.status !== 202) throw new HttpError(`${ROUTES.mcp}/${name}`, res.status, await res.text().catch(() => ""), retryAfterMs(res.headers.get("retry-after")));
         return res;
-      }, { deadline: Date.now() + TOOL_RETRY_MS });
+      }, { deadline: Date.now() + TOOL_RETRY_MS, ...(once && { again: notRun }) });
       const sid = res.headers.get("mcp-session-id");
       if (sid) session = sid;
       if (res.status === 202) return;
@@ -4211,7 +4279,8 @@ async function cmdMcp(argv) {
         if (text) { const j = JSON.parse(text); for (const x of Array.isArray(j) ? j : [j]) emit(x); }
       }
     } catch (e) {
-      if (m && m.id !== undefined && m.method) out({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: `autocraft proxy: ${msg(e)}` } });
+      const why = once && !(e instanceof Gone) && !notRun(e) ? msg(mayHaveRun(e)) : msg(e);
+      if (m && m.id !== undefined && m.method) out({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: `autocraft proxy: ${why}` } });
     }
   };
   for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
@@ -4247,11 +4316,29 @@ async function cmdTool(argv) {
   let args;
   try { args = JSON.parse(json ?? "{}"); } catch { throw new Error("the tool arguments must be JSON"); }
   const { secret, server } = leaseAccess(id);
-  // A `check` streams whitespace while it runs; a reply cut off or a 5xx runs the call again.
-  /** @type {{ content?: { text?: string }[], isError?: boolean }} */
-  const r = await withRetry(() => api(server, `${ROUTES.tool}/${name}/${tool}`, secret, args, { timeoutMs: 60 * 60_000 }), { deadline: Date.now() + TOOL_RETRY_MS });
-  console.log((r.content ?? []).map((c) => c.text ?? "").join("\n"));
+  // A `check` streams whitespace while it runs; a reply cut off or a 5xx runs the call again, except for a server whose calls must not run twice.
+  const once = ONCE_SERVERS.has(name);
+  /** @type {{ content?: { type?: string, text?: string }[], isError?: boolean }} */
+  let r;
+  try {
+    r = await withRetry(() => api(server, `${ROUTES.tool}/${name}/${tool}`, secret, args, { timeoutMs: 60 * 60_000 }), { deadline: Date.now() + TOOL_RETRY_MS, ...(once && { again: notRun }) });
+  } catch (e) {
+    if (once && !(e instanceof Gone) && !notRun(e)) throw mayHaveRun(e);
+    throw e;
+  }
+  console.log(contentText(r.content));
   return r.isError ? 1 : 0;
+}
+
+/**
+ * The text of a tool reply's content, with a line for each image, which a command cannot show.
+ * @param {{ type?: string, text?: string }[] | undefined} content
+ */
+export function contentText(content) {
+  const c = content ?? [];
+  const texts = c.filter((x) => x.type !== "image").map((x) => x.text ?? "");
+  const images = c.length - texts.length;
+  return [...texts, ...(images ? [`[${images} image${images === 1 ? "" : "s"} not shown: this command prints text only]`] : [])].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -4927,7 +5014,7 @@ export function parseToolArgs(tool, argv, cmd) {
 function printResult(r, json) {
   if (json) console.log(JSON.stringify(r, null, 2));
   else {
-    const text = (r?.content ?? []).map((c) => c.text ?? "").join("\n") || (r?.structuredContent !== undefined ? JSON.stringify(r.structuredContent, null, 2) : "");
+    const text = contentText(r?.content) || (r?.structuredContent !== undefined ? JSON.stringify(r.structuredContent, null, 2) : "");
     (r?.isError ? console.error : console.log)(text);
   }
   return r?.isError ? 1 : 0;

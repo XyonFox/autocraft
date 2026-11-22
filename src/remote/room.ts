@@ -9,7 +9,7 @@
 // only user (manual-only.ts) take only the user's own picks and follow-ups, so they are no room.
 import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
 import { PERM_READ_TTL } from "../dash/server/sessions.ts";
-import { leasedBy, queueSnapshot, runnerTakes } from "./calls.ts";
+import { ownLaneLeasesOfToken, leasedBy, queueSnapshot, runnerTakes } from "./calls.ts";
 import { claimClass } from "./claim-class.ts";
 import { STATUS_FRESH_MS } from "./helpers.ts";
 import { manualExpr } from "./manual-only.ts";
@@ -73,7 +73,7 @@ export type RoomState = { ready: Helper[]; active: Helper[]; takers?: { list: Ta
 export async function roomState(db: Db, nowMs: number = Date.now()): Promise<RoomState> {
   const rows = await filterSeq(await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").leftJoin("main.access as a", "a.login", "t.login")
     .select((eb) => ["t.login", "a.role", "t.idle_claim_at", "t.idle_repos", eb.fn.coalesce("h.slots", eb.lit(1)).as("slots"),
-      eb.selectFrom("main.remote_calls as c").select((e) => e.fn.countAll<number>().as("n")).where("c.state", "=", "leased").whereRef("c.token_id", "=", "t.id").as("leased"),
+      eb.selectFrom("main.remote_calls as c").select((e) => e(e.fn.countAll<number>(), "-", ownLaneLeasesOfToken(db, "t.id")).as("n")).where("c.state", "=", "leased").whereRef("c.token_id", "=", "t.id").as("leased"),
       eb.selectFrom("main.remote_calls as c").select((e) => e.fn.max<number | null>("c.heartbeat_at").as("m")).where("c.state", "=", "leased").whereRef("c.token_id", "=", "t.id").as("beat")]).$narrowType<{ leased: number }>()
     .where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where("h.readiness", "=", "ready").where("h.reported_at", ">=", nowMs - STATUS_FRESH_MS)
     .where((eb) => eb.not(manualExpr(db, eb, "t.login")))), async (h) => (await userSkips(db, h.login)).size < TASK_CHOICES.length && ((await itemFilter(db, h.login))?.refs.size ?? 1) > 0);

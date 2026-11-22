@@ -2,7 +2,7 @@
 // a live caller in claim order, why it waits, and the ready Task Runners. Reads only; picks are in picks.ts.
 import type { ItemRef, ModelQueueWhyCode } from "../../web/src/api/types.ts";
 import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
-import { leasedBy, pickerLogins, pickCounts, queueSnapshot, runnerTakes } from "./calls.ts";
+import { ownLaneLeasesOfToken, leasedBy, pickerLogins, pickCounts, queueSnapshot, runnerTakes } from "./calls.ts";
 import { gating } from "./claim-class.ts";
 import { cooloffOf } from "./cooloff.ts";
 import { STATUS_FRESH_MS } from "./helpers.ts";
@@ -23,7 +23,7 @@ export type ReadyRunner = { login: string; role: string; manual: boolean; tiers:
 export async function readyRunners(db: Db, nowMs: number): Promise<ReadyRunner[]> {
   const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").innerJoin("main.access as a", "a.login", "t.login")
     .select((eb) => ["t.id", "t.login", "a.role", "h.models", eb.fn.coalesce("h.slots", eb.lit(1)).as("slots"), manualExpr(db, eb, "t.login").as("manual"),
-      eb.selectFrom("main.remote_calls as c").select((e) => e.fn.countAll<number>().as("n")).where("c.state", "=", "leased").whereRef("c.token_id", "=", "t.id").as("leased")])
+      eb.selectFrom("main.remote_calls as c").select((e) => e(e.fn.countAll<number>(), "-", ownLaneLeasesOfToken(db, "t.id")).as("n")).where("c.state", "=", "leased").whereRef("c.token_id", "=", "t.id").as("leased")])
     .where("t.kind", "=", "runner").where("t.expires_at", ">", new Date(nowMs).toISOString()).where("h.readiness", "=", "ready").where("h.reported_at", ">=", nowMs - STATUS_FRESH_MS)
     .orderBy("t.id"));
   const accepted = await acceptedModels(db);
@@ -52,10 +52,13 @@ export async function readyRunners(db: Db, nowMs: number): Promise<ReadyRunner[]
 }
 
 /** What whyWaiting reads of a queued call. `picked`: its live pick (login null when the viewer may not see it). */
-export type WhyCall = { tier: Tier; promptId: string; step: string; repos: readonly string[]; refs?: readonly ItemRef[]; followUp: boolean; picked: { login: string | null } | null };
+export type WhyCall = { tier: Tier; promptId: string; step: string; repos: readonly string[]; refs?: readonly ItemRef[]; followUp: boolean; picked: { login: string | null } | null;
+  /** The user whose own runners alone take it; `shown`: the viewer may see the login. */
+  bound?: { login: string; shown: boolean } | null };
 
 /**
- * Why a queued call waits, most specific first: its pick; the runner that holds its session; no ready runner for its tier;
+ * Why a queued call waits, most specific first: its pick; the runner that holds its session; the user it is bound to (their
+ * runners not ready, busy or next); no ready runner for its tier;
  * every such runner Manual only; no such runner's user may take it (role rules, write permission as last confirmed, My
  * repos); none of them takes its task (my-tasks.ts); none of those takes its items (task-items.ts); every runner that may take
  * it busy; else the calls ahead of it.
@@ -63,6 +66,12 @@ export type WhyCall = { tier: Tier; promptId: string; step: string; repos: reado
 export function whyWaiting(c: WhyCall, runners: readonly ReadyRunner[], ahead: number, canWrite: (login: string, repo: string) => boolean): { code: ModelQueueWhyCode; text: string } {
   if (c.picked) return { code: "picked", text: c.picked.login ? `Picked by ${c.picked.login}` : "Picked by a user" };
   if (c.followUp) return { code: "session", text: "Waiting for the Task Runner that holds its session" };
+  if (c.bound) {
+    const whose = c.bound.shown ? `${c.bound.login}'s Task Runner` : "the asker's own Task Runner";
+    const own = runners.filter((r) => r.login.toLowerCase() === c.bound!.login.toLowerCase() && r.tiers.has(c.tier));
+    if (!own.length) return { code: "bound-off", text: `Runs only on ${whose}, which is not ready` };
+    return { code: "bound", text: own.some((r) => r.free > 0) ? `Next on ${whose}` : `Waiting for ${whose}: it is busy` };
+  }
   const forTier = runners.filter((r) => r.tiers.has(c.tier));
   if (!forTier.length) return { code: "no-runner", text: `No Task Runner is ready for the ${c.tier} tier` };
   const auto = forTier.filter((r) => !r.manual);
@@ -81,7 +90,7 @@ export function whyWaiting(c: WhyCall, runners: readonly ReadyRunner[], ahead: n
 
 /** A queued call of the view, before the role's redaction. `pickedBy`: the login of its live pick. */
 export type QueuedCall = {
-  id: number; step: string; promptId: string; tier: Tier; model: string; refs: ItemRef[]; repos: string[]; authors: ReadonlySet<string>;
+  id: number; step: string; promptId: string; tier: Tier; model: string; refs: ItemRef[]; repos: string[]; authors: ReadonlySet<string>; forLogin: string | null;
   waitedMs: number; followUp: boolean; gating: boolean; pickedBy: string | null; pickUntil: number | null; seenAt: number; lastError: string | null;
   why: { code: ModelQueueWhyCode; text: string };
 };
@@ -108,11 +117,11 @@ export async function queueView(db: Db, nowMs: number, showPicker: boolean, canW
     const picked = await pickCounts(r, nowMs, async (l) => fresh.has(l)) ? r.pickedBy : null;
     const followUp = r.parent_id !== null;
     const n = ahead.get(r.tier) ?? 0;
-    const why = whyWaiting({ tier: r.tier, promptId: r.prompt_id, step: r.step, repos: r.repos, refs: r.refs, followUp, picked: picked === null ? null : { login: showPicker ? picked : null } }, runners, n, canWrite);
-    // A call of repos or a task no ready runner takes is passed over, so it is no call ahead of the next.
-    if (!followUp && picked === null && why.code !== "task-off" && why.code !== "items-off" && why.code !== "no-repo-access") ahead.set(r.tier, n + 1);
+    const why = whyWaiting({ tier: r.tier, promptId: r.prompt_id, step: r.step, repos: r.repos, refs: r.refs, followUp, picked: picked === null ? null : { login: showPicker ? picked : null }, bound: r.forLogin === null ? null : { login: r.forLogin, shown: showPicker } }, runners, n, canWrite);
+    // A call of repos or a task no ready runner takes is passed over, so it is no call ahead of the next; nor is one bound to a user.
+    if (!followUp && picked === null && r.forLogin === null && why.code !== "task-off" && why.code !== "items-off" && why.code !== "no-repo-access") ahead.set(r.tier, n + 1);
     calls.push({
-      id: r.id, step: r.step, promptId: r.prompt_id, tier: r.tier, model: x.asked_model, refs: r.refs, repos: r.repos, authors: r.authors,
+      id: r.id, step: r.step, promptId: r.prompt_id, tier: r.tier, model: x.asked_model, refs: r.refs, repos: r.repos, authors: r.authors, forLogin: r.forLogin,
       waitedMs: Number(x.queued_ms) + (x.queued_since === null ? 0 : Math.max(0, nowMs - Number(x.queued_since))), followUp, gating: gating(r),
       pickedBy: picked, pickUntil: picked === null ? null : r.pickUntil, seenAt: r.seen_at, lastError: x.error, why,
     });

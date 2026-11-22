@@ -4,7 +4,10 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { listAccounts } from "../src/agents/accounts.ts";
+import { AccountError, listAccounts } from "../src/agents/accounts.ts";
+import { accountAction, accountList } from "../src/agents/account-actions.ts";
+import { startWorkerServer } from "../src/build/worker-api.ts";
+import { INTERNAL_HEADER, signInternal, useRunnerClient } from "../src/remote/runner-client.ts";
 import { readUsage } from "../src/agents/box.ts";
 import { timing } from "../src/agents/login.ts";
 import { AccountWatcher, addAccount, beginLogin, refreshNow, sendCode, signOut, stopLogin } from "../src/agents/manage.ts";
@@ -101,6 +104,31 @@ describe("claude accounts", () => {
     assert.equal(readUsage(c.id)?.fiveHour?.pct, 42);
   });
 
+  test("with a runner client, account actions and the list run on the runner's worker API as the signed login", async () => {
+    const key = "k".repeat(40);
+    const w = await startWorkerServer({ db, listen: "127.0.0.1:0", internalKey: key });
+    const paths: string[] = [];
+    w.server.prependListener("request", (req) => paths.push(req.url ?? ""));
+    useRunnerClient({ url: w.url, sessionKey: key });
+    try {
+      await assert.rejects(async () => await accountAction(db, "add", undefined, { label: "x@example.com" }, "op"), (e) => e instanceof AccountError && e.status === 400);
+      const a = await accountAction(db, "add", undefined, { label: "Remote" }, "op2");
+      assert.equal((await accountAction(db, "login-start", a.id, undefined, "op2")).login?.url, "https://claude.example/oauth/authorize?code=true&state=abc");
+      assert.ok((await accountList(db)).some((x) => x.id === a.id && x.login?.state === "waiting"));
+      await accountAction(db, "login-cancel", a.id, undefined, "op2");
+      assert.deepEqual(paths, ["/internal/accounts/add", "/internal/accounts/add", "/internal/accounts/login-start", "/internal/accounts/list", "/internal/accounts/login-cancel"]);
+      assert.equal((await db.get(db.k.selectFrom("audit").select("login").where("action", "=", "account-login-start").where("target", "=", `account:${a.id}`)))!.login, "op2");
+      // A request signed with another key, or for another path, is refused.
+      const forged = await fetch(`${w.url}/internal/accounts/list`, { method: "POST", headers: { [INTERNAL_HEADER]: signInternal("x".repeat(40), "POST", "/internal/accounts/list", "{}", "op") }, body: "{}" });
+      assert.equal(forged.status, 401);
+      const moved = await fetch(`${w.url}/internal/accounts/sign-out`, { method: "POST", headers: { [INTERNAL_HEADER]: signInternal(key, "POST", "/internal/accounts/list", "{}", "op") }, body: "{}" });
+      assert.equal(moved.status, 401);
+    } finally {
+      useRunnerClient(null);
+      await w.close();
+    }
+  });
+
   test("usage parsing leaves out a window that has not started and rejects other output", () => {
     const p = parseUsage('{"usage_report":{"rate_limits":{"limits":[{"kind":"weekly_all","percent":3,"resets_at":"2026-11-05T00:00:00Z"},{"kind":"session","percent":1,"resets_at":null}]}}}', 100)!;
     assert.deepEqual(Object.keys(p.rate_limits), ["seven_day"]);
@@ -115,3 +143,14 @@ async function waitFor(f: () => Promise<boolean>, ms = 5000): Promise<void> {
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+test("an internal token works once and not when its expiry is far in the future", async () => {
+  const { verifyInternal } = await import("../src/remote/runner-client.ts");
+  const key = "k".repeat(40);
+  const now = Date.now();
+  const t = signInternal(key, "POST", "/internal/accounts/list", "{}", "op", now);
+  assert.equal(verifyInternal(key, t, "POST", "/internal/accounts/list", "{}", now), "op");
+  assert.equal(verifyInternal(key, t, "POST", "/internal/accounts/list", "{}", now), null, "a replay is refused");
+  const far = signInternal(key, "POST", "/internal/accounts/list", "{}", "op", now + 3_600_000);
+  assert.equal(verifyInternal(key, far, "POST", "/internal/accounts/list", "{}", now), null);
+});

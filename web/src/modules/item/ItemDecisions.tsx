@@ -94,13 +94,14 @@ export function OpenQuestions({ ds, choices, updating, evidence }: { ds: Decisio
   );
 }
 
-type Rec = { label: string; effect: string | null; tags: DecisionChoices["cores"][number]["writes"] };
+/** `after`: the login whose message to Opus led to the current choices. */
+type Rec = { label: string; effect: string | null; tags: DecisionChoices["cores"][number]["writes"]; after?: string };
 
 /** What Opus recommends as the label and the one line of what it does; null without a recommendation. */
 function recommended(d: Decision, choices: DecisionChoices | null | undefined): Rec | null {
   if (choices) {
     const core = choices.cores.find((c) => c.key === choices.pick?.core);
-    return core ? { label: core.label, effect: core.autocraft, tags: core.writes } : null;
+    return core ? { label: core.label, effect: core.autocraft, tags: core.writes, ...(choices.after && { after: choices.after }) } : null;
   }
   const o = d.options.find((x) => x.key === d.recommended);
   return o ? { label: o.label, effect: o.hint ?? null, tags: [] } : null;
@@ -113,6 +114,7 @@ function Recommendation({ rec, reason }: { rec: Rec; reason: string | null }) {
       <p className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm">
         <span className="text-xs font-medium text-accent-ink">Opus recommends</span>
         <span className="min-w-0 break-words font-semibold">{rec.label}</span>
+        {rec.after && <span className="text-xs text-ink/70">after {rec.after}'s message</span>}
       </p>
       {rec.effect && <p className="mt-0.5 text-xs leading-5 text-ink/70">{rec.effect}</p>}
       {reason && <p className="mt-1.5 text-pretty text-sm leading-[21px] text-ink/85">{reason}</p>}

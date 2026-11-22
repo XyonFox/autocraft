@@ -47,7 +47,7 @@ export async function get(db: Db, req: Req): Promise<ModelQueue> {
   for (const c of calls) {
     if (visible && c.repos.some((r) => !visible.has(r))) continue;
     if (!staff && !c.repos.length) continue;
-    const pickable = state.canPick && (await pickRefusal(state, user, { id: c.id, tier: c.tier, promptId: c.promptId, parentId: c.followUp ? c.id : null, repos: c.repos, authors: c.authors, seenAt: c.seenAt, pickedBy: c.pickedBy, pickUntil: c.pickUntil }, nowMs, async (l) => fresh.has(l))) === null;
+    const pickable = state.canPick && (await pickRefusal(state, user, { id: c.id, tier: c.tier, promptId: c.promptId, parentId: c.followUp ? c.id : null, repos: c.repos, authors: c.authors, seenAt: c.seenAt, pickedBy: c.pickedBy, pickUntil: c.pickUntil, forLogin: c.forLogin }, nowMs, async (l) => fresh.has(l))) === null;
     out.push({
       id: c.id, items: await withShown(db, c.refs), kind: stepTitle(c.step), tier: c.tier, model: c.model, estCostUsd: await estimate(db, c.promptId, nowMs), waitedMs: c.waitedMs, why: c.why,
       picked: c.pickedBy === null ? null : staff ? { login: c.pickedBy } : {}, pickable, gating: c.gating, followUp: c.followUp,

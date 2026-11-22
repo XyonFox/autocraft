@@ -4,9 +4,12 @@
 // returned once, on creation and rotation. Whatever a worker reported is data:
 // viewers get neither logs, patches nor artifact downloads; the page shows it as text and artifacts download with `attachment` (PNG inline),
 // `nosniff` and `Content-Security-Policy: sandbox`.
+import { filterSeq } from "../../async-seq.ts";
+import { mayRunRepo } from "../repo-access.ts";
 import { readFileSync } from "node:fs";
 import type { BuildEnv, BuildFeatureState, ScreenshotSetups, BuildFeatures, BuildSummary, BuildTask, BuildTaskDetail, TaskFilter, TaskPage, TaskState } from "../../../web/src/api/types.ts";
 import { absolute } from "../../build/artifacts.ts";
+import { callRunner, runnerClient, RunnerError } from "../../remote/runner-client.ts";
 import { BuildError, createEnv, listEnvs, rotateKey, updateEnv } from "../../build/envs.ts";
 import { PRIVATE_STEPS, cancelTask, getTaskDetail, listTasks, summary } from "../../build/tasks.ts";
 import { BUILD_FEATURES, REPO_SCOPED, featureStates, isFeature, setFeature } from "../../build/features.ts";
@@ -64,11 +67,13 @@ async function visibleTask(db: Db, req: Req): Promise<BuildTaskDetail> {
 /** Viewers get the task without its log and patch. */
 export const task = async (db: Db, req: Req) => wrap(async (): Promise<BuildTaskDetail> => {
   const t = await visibleTask(db, req);
-  return canSeeInternals(req) ? t : { ...t, logTail: null, logBytes: 0, logTruncated: false, patch: null };
+  const canCancel = await mayRunRepo(req.user, t.repo);
+  return canSeeInternals(req) ? { ...t, canCancel } : { ...t, canCancel, logTail: null, logBytes: 0, logTruncated: false, patch: null };
 });
 
 export const cancel = async (db: Db, req: Req): Promise<BuildTask> => wrap(async () => {
-  await visibleTask(db, req);
+  const t = await visibleTask(db, req);
+  await needRunRepo(req, t.repo);
   return await cancelTask(db, req.params.id, req.user.login);
 });
 
@@ -116,7 +121,13 @@ export const postFeature = async (db: Db, req: Req): Promise<BuildFeatures> => {
 
 async function screenshotSetups(db: Db, req: Req): Promise<ScreenshotSetups> {
   const shown = new Set(await visibleRepos(db, req));
-  return { setups: (await listConfigs(db)).filter((c) => shown.has(c.repo)).map(({ repo, updatedBy, updatedAt, ...config }) => ({ repo, config, updatedBy, updatedAt })) };
+  const manageable = await filterSeq([...shown].sort(), async (r) => await mayRunRepo(req.user, r));
+  return { setups: (await listConfigs(db)).filter((c) => shown.has(c.repo)).map(({ repo, updatedBy, updatedAt, ...config }) => ({ repo, config, updatedBy, updatedAt })), manageable };
+}
+
+/** An operator, or a maintainer with write access to the repo, changes its build settings. */
+async function needRunRepo(req: Req, repo: string | undefined): Promise<void> {
+  if (!repo || !await mayRunRepo(req.user, repo)) throw new HttpError(403, "only an operator, or a maintainer with write access to the repo, changes its build settings");
 }
 
 async function trackedRepo(db: Db, repo: string): Promise<string> {
@@ -130,6 +141,7 @@ export const screenshots = async (db: Db, req: Req): Promise<ScreenshotSetups> =
 };
 
 export const putScreenshots = async (db: Db, req: Req): Promise<ScreenshotSetups> => {
+  await needRunRepo(req, req.params.repo);
   const repo = await trackedRepo(db, req.params.repo);
   try {
     await putConfig(db, req.user.login, repo, req.json);
@@ -141,24 +153,39 @@ export const putScreenshots = async (db: Db, req: Req): Promise<ScreenshotSetups
 };
 
 export const deleteScreenshots = async (db: Db, req: Req): Promise<ScreenshotSetups> => {
+  await needRunRepo(req, req.params.repo);
   if (!await deleteConfig(db, req.user.login, req.params.repo)) throw new HttpError(404, "no screenshot setup for that repo");
   return screenshotSetups(db, req);
 };
+
+/** An artifact's bytes: from the artifact directory when it is on this disk, otherwise from the runner, which stored them. */
+async function artifactBytes(db: Db, taskId: number, name: string, login: string): Promise<Buffer> {
+  const c = runnerClient();
+  if (c) {
+    try {
+      return Buffer.from(await (await callRunner(c, "GET", `/internal/artifacts/${taskId}/${encodeURIComponent(name)}`, login)).arrayBuffer());
+    } catch (e) {
+      if (e instanceof RunnerError && e.status === 404) throw new HttpError(404, e.message);
+      throw e;
+    }
+  }
+  const row = await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", taskId).where("name", "=", name));
+  const path = row && absolute(row.file);
+  if (!path) throw new HttpError(404, "no such artifact");
+  try {
+    return readFileSync(path);
+  } catch {
+    throw new HttpError(404, "the artifact file is gone");
+  }
+}
 
 export async function artifact(db: Db, req: Req): Promise<Res> {
   try {
     if (!canSeeInternals(req)) throw new HttpError(403, "only operators and maintainers download artifacts");
     const t = await visibleTask(db, req);
     const a = t.artifacts.find((x) => x.name === req.params.name);
-    const row = a && (await db.get(db.k.selectFrom("build_artifacts").select("file").where("task_id", "=", t.id).where("name", "=", a.name)));
-    const path = row && absolute(row.file);
-    if (!a || !path) throw new HttpError(404, "no such artifact");
-    let data: Buffer;
-    try {
-      data = readFileSync(path);
-    } catch {
-      throw new HttpError(404, "the artifact file is gone");
-    }
+    if (!a) throw new HttpError(404, "no such artifact");
+    const data = await artifactBytes(db, t.id, a.name, req.user.login);
     return {
       body: data,
       headers: {

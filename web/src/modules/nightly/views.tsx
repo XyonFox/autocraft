@@ -7,7 +7,6 @@ import { Badge } from "../../ui/atoms/Badge";
 import { Switch } from "../../ui/atoms/Switch";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { cn } from "../../ui/cn";
-import { useUser } from "../../shell/UserContext";
 import { Block, ErrorLine, Page, TextInput, useWrite } from "../admin/parts";
 import { Sparkline } from "./Sparkline";
 
@@ -121,7 +120,6 @@ function RepoBlock({ repo, operator, write, onSelect }: { repo: NightlyRepo; ope
 export function NightlyView() {
   const api = useApi();
   const q = useQuery<NightlyGrid>("nightly", (a) => a.nightly.grid());
-  const operator = useUser().role === "operator";
   const write = useWrite();
   const select = (repo: string, c: NightlyCheckRow, enabled: boolean, names?: string[]) =>
     void write.run(`${repo}:${c.id}`, () => api.nightly.select({ repo, check: c.id, enabled, ...(names ? (c.takes === "targets" ? { targets: names } : { crates: names }) : {}) })).then(() => q.refetch());
@@ -130,7 +128,7 @@ export function NightlyView() {
     <Page title="Nightly">
       <ErrorLine error={q.error?.message ?? write.error} />
       <div className="grid gap-4">
-        {repos.map((r) => <RepoBlock key={r.repo} repo={r} operator={operator} write={write} onSelect={select} />)}
+        {repos.map((r) => <RepoBlock key={r.repo} repo={r} operator={r.canSelect} write={write} onSelect={select} />)}
         {q.data && repos.length === 0 && <p className="text-sm text-ink/55">No repo has nightly checks on.</p>}
       </div>
     </Page>

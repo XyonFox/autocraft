@@ -1,17 +1,18 @@
 // GitHub App registration through the dashboard, with a fake GitHub for the
-// manifest conversion: the keys land in the secrets file (mode 0600) and
+// manifest conversion: the keys are stored sealed in the database and
 // nowhere else, the state nonce works once, only operators reach the page's
 // API, and app sign-in keeps the user's token sealed in user_tokens.
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 import { addLogin } from "../src/access.ts";
 import { loadConfig } from "../src/dash/server/config.ts";
-import { sha256hex } from "../src/dash/server/crypto.ts";
+import { sha256hex, TokenBox } from "../src/dash/server/crypto.ts";
+import { AppKeys } from "../src/github/app-keys.ts";
 import { startServer } from "../src/dash/server/index.ts";
 import { FakeProvider } from "../src/dash/server/provider.ts";
 import type { Route } from "../src/dash/types.ts";
@@ -134,6 +135,11 @@ class Client {
   }
 }
 
+/** Forgets the stored app, so the next server imports its own secrets file. */
+async function resetApp(): Promise<void> {
+  await db.run(db.k.deleteFrom("github_app"));
+}
+
 async function signedIn(login: string, origin = base): Promise<Client> {
   const c = new Client(origin);
   const start = await c.req("/auth/signin?return_to=/");
@@ -153,7 +159,7 @@ describe("github app registration", () => {
     }
   });
 
-  test("registration stores the keys 0600, returns none of them, and the state works once", async () => {
+  test("registration stores the keys sealed in the database, returns none of them, and the state works once", async () => {
     const boss = await signedIn("boss");
     const before = (await (await boss.req("/api/admin/github-app")).json()) as { configured: boolean };
     assert.equal(before.configured, false);
@@ -168,12 +174,10 @@ describe("github app registration", () => {
     const done = await boss.req(`/auth/github-app/callback?code=good-code&state=${state}`);
     assert.equal(done.status, 303);
     assert.equal(done.headers.get("location"), "/admin/github-app");
-    assert.equal(statSync(secretsFile).mode & 0o777, 0o600);
-    const stored = JSON.parse(readFileSync(secretsFile, "utf8")) as Record<string, string>;
-    assert.equal(stored.github_app_slug, "autocraft-test");
-    assert.equal(stored.github_app_private_key, PEM);
-    assert.equal(stored.github_app_client_secret, CLIENT_SECRET);
-    assert.deepEqual(stored.github_app_owner, { login: "glasswing", type: "Organization" });
+    assert.ok(!existsSync(secretsFile), "registration writes no file");
+    const row = (await db.get(db.k.selectFrom("github_app").select(["slug", "keys_enc"])))!;
+    assert.equal(row.slug, "autocraft-test");
+    for (const secret of [PEM.slice(40, 80), CLIENT_SECRET, WEBHOOK_SECRET]) assert.ok(!row.keys_enc!.includes(secret));
 
     const replay = await boss.req(`/auth/github-app/callback?code=good-code&state=${state}`);
     assert.equal(replay.status, 400);
@@ -206,56 +210,48 @@ describe("github app registration", () => {
     assert.equal((await db.get(db.k.selectFrom("user_tokens").select("version").where("login", "=", "maint")))!.version, 2);
   });
 
-  test("a secrets file that cannot be written keeps the app's slug visible and leaks no key", async () => {
-    const dir2 = join(dir, "readonly");
-    mkdirSync(dir2);
-    const file2 = join(dir2, "secrets.json");
-    const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file2 };
-    const s = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [], githubApi: `http://127.0.0.1:${(github.address() as AddressInfo).port}` });
-    closers.push(s.close);
-    const boss = await signedIn("boss", s.url);
-    const start = async () => /settings\/apps\/new\?state=([A-Za-z0-9_-]+)/.exec(await (await boss.post("/auth/github-app/start", { csrf: await boss.csrf() })).text())![1]!;
-    const errors: string[] = [];
-    const log = console.error;
-    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
-    try {
-      // The directory turns read-only while GitHub converts the code: the probe passed, the write fails.
-      const state = await start();
-      onConvert = () => chmodSync(dir2, 0o500);
-      const page = await (await boss.req(`/auth/github-app/callback?code=good-code&state=${state}`)).text();
-      onConvert = () => {};
-      assert.match(page, /autocraft-test/);
-      assert.match(page, /https:\/\/github\.com\/organizations\/glasswing\/settings\/apps\/autocraft-test/);
-      assert.match(page, /EACCES/);
-      // With the directory still read-only, a new registration stops before GitHub is asked.
-      const before = converted.length;
-      assert.equal((await boss.post("/auth/github-app/start", { csrf: await boss.csrf() })).status, 409);
-      assert.equal(converted.length, before);
-      const text = JSON.stringify(await db.all(db.k.selectFrom("audit").select(kx.cols("audit")))) + page + errors.join("\n");
-      for (const secret of [PEM.slice(40, 80), CLIENT_SECRET, WEBHOOK_SECRET]) assert.ok(!text.includes(secret));
-      assert.match(errors.join("\n"), /autocraft-test/);
-    } finally {
-      console.error = log;
-      chmodSync(dir2, 0o700);
-    }
-  });
+  test("a secrets file's app keys are imported once, other processes see the stored keys, and a removed app stays removed", async () => {
+    const file = join(dir, "import-secrets.json");
+    writeFileSync(file, JSON.stringify({ github_app_id: "9", github_app_slug: "file-app", github_app_private_key: PEM, github_app_client_id: "Iv1.file", github_app_client_secret: CLIENT_SECRET, github_app_owner: { login: "glasswing", type: "Organization" } }), { mode: 0o600 });
+    const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file };
+    await resetApp();
+    const githubApi = `http://127.0.0.1:${(github.address() as AddressInfo).port}`;
+    const one = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [], githubApi });
+    closers.push(one.close);
+    const status = async (url: string) => (await (await (await signedIn("boss", url)).req("/api/admin/github-app")).json()) as { configured: boolean; app: { slug: string } | null };
+    assert.equal((await status(one.url)).app?.slug, "file-app");
+    assert.ok(!(await db.get(db.k.selectFrom("github_app").select("keys_enc")))!.keys_enc!.includes(CLIENT_SECRET));
 
-  test("the app's keys are read again when the keys file changes, with no restart", () => {
-    const file = join(dir, "follow-keys.json");
-    writeFileSync(file, "{}", { mode: 0o600 });
-    const config = loadConfig({ AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file });
-    const keys = () => (config as unknown as Record<string, { app: { slug: string } | null }>)["sec" + "rets"]!.app;
-    assert.equal(keys(), null);
-    writeFileSync(file, JSON.stringify({ github_app_id: "9", github_app_slug: "late-app", github_app_private_key: PEM, github_app_client_id: "Iv1.late", github_app_client_secret: CLIENT_SECRET }), { mode: 0o600 });
-    assert.equal(keys()?.slug, "late-app");
-    writeFileSync(file, "{}", { mode: 0o600 });
-    assert.equal(keys(), null);
+    // A second dashboard (another replica) whose secrets file has no app keys reads them from the database.
+    const bare = join(dir, "import-bare.json");
+    writeFileSync(bare, "{}", { mode: 0o600 });
+    const two = await startServer({ config: loadConfig({ ...env, AUTOCRAFT_SECRETS_FILE: bare }), db, provider: new FakeProvider(permsFile), routes: [], githubApi });
+    closers.push(two.close);
+    assert.equal((await status(two.url)).app?.slug, "file-app");
+
+    // Under another session_key the stored keys are unreadable, said so, and a new registration replaces them only when confirmed.
+    const other = await new AppKeys(db, new TokenBox("o".repeat(40)), null).load();
+    assert.equal(other.current(), null);
+    assert.equal(other.unreadable(), true);
+    const replaced = { id: "77", slug: "other-app", privateKey: PEM, clientId: "Iv1.o", clientSecret: "o", webhookSecret: null, owner: null };
+    await assert.rejects(other.save(replaced), { code: "EUNREADABLE" });
+    await other.save(replaced, true);
+    assert.equal((await new AppKeys(db, new TokenBox("o".repeat(40)), null).load()).current()?.slug, "other-app");
+    await assert.rejects(other.save(replaced), /another app/);
+
+    // Removed through one dashboard, the app is not imported again from the file at the next start.
+    assert.equal((await (await signedIn("boss", one.url)).json("/api/admin/github-app/remove", {})).status, 200);
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).github_app_slug, "file-app");
+    const three = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [], githubApi });
+    closers.push(three.close);
+    assert.equal((await status(three.url)).configured, false);
   });
 
   test("the identity route refuses with the uncovered repos listed, and a switch ends every session", async () => {
     const file = join(dir, "identity-secrets.json");
     writeFileSync(file, JSON.stringify({ github_app_id: "4242", github_app_slug: "autocraft-test", github_app_private_key: PEM, github_app_client_id: "Iv1.test", github_app_client_secret: CLIENT_SECRET }), { mode: 0o600 });
     const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file };
+    await resetApp();
     const s = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [] });
     closers.push(s.close);
     const boss = await signedIn("boss", s.url);
@@ -297,6 +293,7 @@ describe("github app registration", () => {
     const file = join(dir, "setup-secrets.json");
     writeFileSync(file, "{}", { mode: 0o600 });
     const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file };
+    await resetApp();
     const s = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [], githubApi: `http://127.0.0.1:${(github.address() as AddressInfo).port}` });
     closers.push(s.close);
     const boss = await signedIn("boss", s.url);
@@ -344,7 +341,7 @@ describe("github app registration", () => {
     assert.ok(state, "the manifest goes to the org");
     assert.match(create.t, /&#34;setup_url&#34;:&#34;http:\/\/127\.0\.0\.1:\d+\/auth\/github-app\/setup&#34;/);
     assert.equal((await owner.req(`/auth/github-app/callback?code=good-code&state=${state}`)).status, 303);
-    assert.equal(JSON.parse(readFileSync(file, "utf8")).github_app_slug, "autocraft-test");
+    assert.equal((await db.get(db.k.selectFrom("github_app").select("slug")))!.slug, "autocraft-test");
 
     // Organization roles answer 404 (Free plan): the page offers the settings link instead.
     const manage = await owner.post("/auth/setup/manager", {});
@@ -387,6 +384,7 @@ describe("github app registration", () => {
     const file = join(dir, "setup2-secrets.json");
     writeFileSync(file, "{}", { mode: 0o600 });
     const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file };
+    await resetApp();
     const provider = new FakeProvider(permsFile);
     const s = await startServer({ config: loadConfig(env), db, provider, routes: [], githubApi: `http://127.0.0.1:${(github.address() as AddressInfo).port}` });
     closers.push(s.close);
@@ -434,8 +432,7 @@ describe("github app registration", () => {
 
     // The owner's flow still works: create, then a 403 on the role list leaves the settings link and the Install step.
     assert.equal((await a.req(`/auth/github-app/callback?code=good-code&state=${stateA2}`)).status, 303);
-    const keys = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
-    assert.equal(keys.github_app_slug, "autocraft-test");
+    assert.equal((await db.get(db.k.selectFrom("github_app").select("slug")))!.slug, "autocraft-test");
     const pageB = await text(b, "/auth/setup");
     assert.match(pageB, /Make boss an app manager/);
     rolesAnswer = 403;
@@ -456,10 +453,11 @@ describe("github app registration", () => {
     assert.equal((await boss.req("/auth/github-app/setup?installation_id=5")).headers.get("location"), "/admin/github-app");
   });
 
-  test("remove clears the app's keys from the file and memory, and is refused while the GitHub identity is the app", async () => {
+  test("remove clears the app's keys from the database and memory, and is refused while the GitHub identity is the app", async () => {
     const file = join(dir, "remove-secrets.json");
     writeFileSync(file, JSON.stringify({ other_key: "kept", github_app_id: "4242", github_app_slug: "autocraft-test", github_app_private_key: PEM, github_app_client_id: "Iv1.test", github_app_client_secret: CLIENT_SECRET, github_app_webhook_secret: "", github_app_owner: { login: "glasswing", type: "Organization" } }), { mode: 0o600 });
     const env = { AUTOCRAFT_DEV_AUTH: "1", AUTOCRAFT_LISTEN: "127.0.0.1:0", AUTOCRAFT_DB: dbFile, AUTOCRAFT_DEV_PERMS: permsFile, AUTOCRAFT_SECRETS_FILE: file };
+    await resetApp();
     const githubApi = `http://127.0.0.1:${(github.address() as AddressInfo).port}`;
     await db.prepare("INSERT INTO settings (key, value) VALUES ('github_identity', 'app') ON CONFLICT (key) DO UPDATE SET value = excluded.value").run();
     const appMode = await startServer({ config: loadConfig(env), db, provider: new FakeProvider(permsFile), routes: [], githubApi });
@@ -478,8 +476,7 @@ describe("github app registration", () => {
     assert.equal(res.status, 200);
     const text = await res.text();
     assert.deepEqual(JSON.parse(text), { settingsUrl: "https://github.com/organizations/glasswing/settings/apps/autocraft-test" });
-    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { other_key: "kept" });
-    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.equal((await db.get(db.k.selectFrom("github_app").select("keys_enc")))!.keys_enc, null);
     assert.equal((await (await boss.req("/api/admin/github-app")).json() as { configured: boolean }).configured, false);
     assert.equal((await db.get(db.k.selectFrom("github_app_states").select((eb) => eb.fn.countAll<number>().as("n"))))!.n, 0);
     assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'github-app-remove' AND target = 'autocraft-test'").get() as { n: number }).n, 1);

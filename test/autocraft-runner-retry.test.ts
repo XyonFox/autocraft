@@ -17,6 +17,9 @@ test("lease requests retry 5xx and resets with backoff, keep the same body, and 
         if (seen.length === 1) { res.writeHead(502, { "Retry-After": "0" }).end("bad gateway"); return; }
         if (seen.length === 2) { req.socket.destroy(); return; }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ accepted: true }));
+      } else if (req.url === "/api/remote/tool/work/shell") {
+        if (seen.length === 1) { res.writeHead(429, { "Retry-After": "0" }).end("slow down"); return; }
+        res.writeHead(502).end("bad gateway");
       } else if (req.url === "/api/remote/heartbeat") res.writeHead(410).end();
       else if (req.url === "/api/remote/release") res.writeHead(400).end("bad body");
       else res.writeHead(503, { "Retry-After": "30" }).end();
@@ -29,6 +32,10 @@ test("lease requests retry 5xx and resets with backoff, keep the same body, and 
     const submit = { ok: true, text: "done" };
     assert.deepEqual(await helper.withRetry(() => helper.api(base, "/api/remote/submit", "s", submit), opt()), { accepted: true });
     assert.deepEqual(hits["/api/remote/submit"], Array(3).fill(JSON.stringify(submit)));
+
+    // A workspace tool call that may have run is not sent again; one refused for the rate is.
+    await assert.rejects(helper.withRetry(() => helper.api(base, "/api/remote/tool/work/shell", "s", { command: "make" }), { ...opt(), again: helper.notRun }), /HTTP 502/);
+    assert.equal(hits["/api/remote/tool/work/shell"].length, 2);
 
     await assert.rejects(helper.withRetry(() => helper.api(base, "/api/remote/heartbeat", "s", { phase: "running" }), opt()), /the lease is gone/);
     assert.equal(hits["/api/remote/heartbeat"].length, 1);

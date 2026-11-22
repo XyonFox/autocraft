@@ -48,7 +48,7 @@ const sshArgs = (s: UpdateSpec): string[] => {
 
 function collect(cmd: string, args: string[], input?: NodeJS.ReadableStream): Promise<{ code: number | null; out: string; err: string }> {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
+    const p = spawn(cmd, args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true });
     let out = "", err = "";
     p.stdout!.on("data", (d) => (out += d));
     p.stderr!.on("data", (d) => (err += d));
@@ -69,7 +69,7 @@ export const sshAdmin: WorkerAdmin = {
   },
   async update(s) {
     if (!validSpec(s)) throw new Error("invalid worker update spec");
-    const git = spawn("git", [`--git-dir=${s.gitDir}`, "archive", s.sha], { stdio: ["ignore", "pipe", "pipe"] });
+    const git = spawn("git", [`--git-dir=${s.gitDir}`, "archive", s.sha], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let gitErr = "";
     git.stderr.on("data", (d) => (gitErr += d));
     const gitDone = new Promise<number | null>((resolve, reject) => { git.on("error", reject); git.on("close", resolve); });

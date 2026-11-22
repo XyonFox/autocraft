@@ -533,7 +533,7 @@ export async function gh(args: string[], owner?: string): Promise<{ code: number
   let env: Awaited<ReturnType<typeof readEnvFor>>;
   try { env = owner !== undefined ? await readEnv(owner) : await readEnvFor("gh", args); } catch (e) { return { code: -1, out: "", err: String((e as Error).message ?? e) }; }
   return new Promise((resolve) => {
-    const p = spawn("gh", args, { cwd: REPO_DIR, timeout: 120_000, ...(env ? { env } : {}) });
+    const p = spawn("gh", args, { cwd: REPO_DIR, timeout: 120_000, windowsHide: true, ...(env ? { env } : {}) });
     const out: Buffer[] = [];
     let err = "";
     p.stdout.on("data", (d: Buffer) => out.push(d));

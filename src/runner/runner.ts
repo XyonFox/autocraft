@@ -4,6 +4,7 @@
 // stops jobs whose cancel was requested, runs the autopilot (queues jobs while the
 // pipeline switch is on) and puts jobs that a stop or an earlier runner left
 // unfinished back in the queue to resume (src/runner/resuming.ts).
+import { copyLogs, JobLogCopy, pruneJobLogs } from "./job-log.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, statSync, closeSync, mkdirSync, openSync, readFileSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
@@ -24,10 +25,13 @@ import { endJob, JOB_KEEP_MS, now, pruneJobs, resumeJob, RUNNER_STOPPED } from "
 import { advanceSecurityFixes, autoFixConfirmed } from "../security/actions.ts";
 import { advanceScanTests } from "../security/scantest.ts";
 import { OffThread } from "./offthread.ts";
+import { groupsFile, killGroups, removeGroupsFile } from "./groups.ts";
 import { buildDiffFacts } from "../review/diff.ts";
 import { loadSteps, modelsOf, usesClaude, type Params } from "./steps.ts";
 import { jobBlock } from "./concurrency.ts";
 import { queueRoomPass } from "../agents/call.ts";
+import { TRY_STEP } from "../build/workspace-session.ts";
+import { noTakerFor } from "../remote/takers.ts";
 import { stepDeadlineMin, stepNoProgressMin } from "./deadlines.ts";
 import { envVar } from "../env.ts";
 import { anyRepinDue } from "../repin/due.ts";
@@ -79,7 +83,7 @@ export type RunnerOptions = {
   graceMs?: number;
 };
 
-type Running = { child: ChildProcess; termAt: number | null; exited: Promise<void>; startedAt: number; deadlineMin: number; logPath: string; /** When the job was told to finish its current item and stop. */ flaggedAt: number | null; noProgressMin: number; /** Why it was told to stop. */ stopMsg: string | null; /** Time in which a user-local call of the job waited for a helper, summed over the checks that saw one waiting. */ remoteWaitMs: number; remoteSeen: { at: number; queued: boolean } | null };
+type Running = { child: ChildProcess; termAt: number | null; exited: Promise<void>; startedAt: number; deadlineMin: number; logPath: string; logCopy: JobLogCopy; /** When the job was told to finish its current item and stop. */ flaggedAt: number | null; noProgressMin: number; /** Why it was told to stop. */ stopMsg: string | null; /** Time in which a user-local call of the job waited for a helper, summed over the checks that saw one waiting. */ remoteWaitMs: number; remoteSeen: { at: number; queued: boolean } | null };
 
 /** The error of a job the runner stopped for running past its step's limit. */
 export const deadlineError = (min: number): string => `stopped: ran past ${min} min`;
@@ -383,6 +387,11 @@ export class Runner {
         this.o.log(`prune jobs: ${(e as Error).message}`);
       }
       try {
+        await pruneJobLogs(this.db, t);
+      } catch (e) {
+        this.o.log(`prune job logs: ${(e as Error).message}`);
+      }
+      try {
         await prunePlanHistory(this.db, JOB_KEEP_MS, t);
       } catch (e) {
         this.o.log(`prune plan history: ${(e as Error).message}`);
@@ -411,6 +420,12 @@ export class Runner {
   }
 
   private async cancels(): Promise<void> {
+    await this.checkRunning();
+    // The new log lines of every running job, in one write (each job at most every JOB_LOG_FLUSH_MS).
+    await copyLogs(this.db, [...this.running.values()].map((r) => r.logCopy)).catch((e: Error) => this.o.log(`job logs not stored: ${e.message}`));
+  }
+
+  private async checkRunning(): Promise<void> {
     for (const [id, r] of this.running) {
       const row = await this.db.get(this.db.k.selectFrom("jobs").select("cancel_requested_at").where("id", "=", id));
       // Time a user-local model call waits for a helper counts like waiting for an account slot: not toward the deadline, and not as a time without progress.
@@ -489,7 +504,12 @@ export class Runner {
       if (!byRepo) room.set(cls, (byRepo = new Map()));
       const key = `${q.step}\n${q.repo ?? ""}`;
       const roomOf = async (): Promise<number> => byRepo.get(key) ?? await pass.room(cls, q.repo ? [q.repo] : undefined, q.step) - started;
-      if (claude && q.repo && !await pass.taker([q.repo], q.step)) continue;
+      if (claude && q.repo && !await pass.taker([q.repo], q.step)) {
+        // A pipeline job waits for a Task Runner; a command-line session job (`workspace try`) is not replanned, so it fails.
+        const why = q.step === TRY_STEP ? await noTakerFor(this.db, q.repo, q.step) : null;
+        if (why) await this.db.run(this.db.k.updateTable("jobs").set({ state: "failed", ended_at: now(), error: why }).where("id", "=", q.id).where("state", "=", "queued"));
+        continue;
+      }
       if (claude && !await this.db.get(this.db.k.selectFrom("jobs").select((eb) => eb.lit(1).as("one")).where("step", "=", step.name).where("state", "=", "running").limit(1))) {
         // Nothing of the step runs: it starts anyway, and takes a slot of the room.
       } else if (claude) {
@@ -521,38 +541,48 @@ export class Runner {
   private async start(id: number, stepName: string, steps: Awaited<ReturnType<typeof loadSteps>>): Promise<boolean> {
     const logPath = join(this.o.logs, `job-${id}.log`);
     // The check and the claim are one write transaction, so a command-line run cannot take the step in between.
+    // Read before the claim: nothing may wait between the claim and the spawn.
+    const logCopy = await JobLogCopy.open(this.db, id, logPath);
+    const deadlineMin = this.maxMin(stepName, await this.limitOf(id));
     const claimed = await this.db.write(async () => await this.blocked(steps, id) ? 0
       : (await this.db.run(this.db.k.updateTable("jobs").set({ state: "running", started_at: now(), log_path: logPath }).where("id", "=", id).where("state", "=", "queued"))).changes);
     if (!claimed) return false;
+    const groups = groupsFile(this.o.logs, id);
+    removeGroupsFile(groups);
     const fd = openSync(logPath, "a");
     let child: ChildProcess;
     try {
       child = spawn(process.execPath, [CLI, "runner", "exec", String(id)], {
         detached: true,
         stdio: ["ignore", fd, fd],
-        env: dbEnv(this.o.dbTarget),
+        env: { ...dbEnv(this.o.dbTarget), AUTOCRAFT_JOB_GROUPS: groups },
+        windowsHide: true,
       });
     } finally {
       closeSync(fd);
     }
-    await this.db.run(this.db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", id));
-    this.o.log(`job ${id}: started (pid ${child.pid})`);
+    // Registered before any await, so abandon() reaches every child that runs.
     let spawnError: string | null = null;
     child.on("error", (e) => (spawnError = e.message));
     const exited = new Promise<void>((resolve) => {
       child.on("close", (code, signal) => {
+        removeGroupsFile(groups);
         void this.finish(id, code, signal, spawnError)
           .catch((e) => {
             this.unrecorded.set(id, { code, signal, spawnError });
             this.o.log(`job ${id}: end not recorded: ${(e as Error).message}`);
           })
+          // After the end is recorded (or not): resumeJob and the deadline notes append to the file first.
+          .then(() => copyLogs(this.db, [logCopy], true).catch((e: Error) => this.o.log(`job ${id}: log not stored: ${e.message}`)))
           .finally(() => {
             this.running.delete(id);
             resolve();
           });
       });
     });
-    this.running.set(id, { child, termAt: null, exited, startedAt: Date.now(), deadlineMin: this.maxMin(stepName, await this.limitOf(id)), logPath, flaggedAt: null, noProgressMin: this.noProgressMin(stepName), stopMsg: null, remoteWaitMs: 0, remoteSeen: null });
+    this.running.set(id, { child, termAt: null, exited, startedAt: Date.now(), deadlineMin, logPath, logCopy, flaggedAt: null, noProgressMin: this.noProgressMin(stepName), stopMsg: null, remoteWaitMs: 0, remoteSeen: null });
+    await this.db.run(this.db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", id));
+    this.o.log(`job ${id}: started (pid ${child.pid})`);
     return true;
   }
 
@@ -570,6 +600,17 @@ export class Runner {
         this.o.log(`job ${id}: end still not recorded: ${(err as Error).message}`);
       }
     }
+  }
+
+  /**
+   * Fencing, after the leader lock was lost (src/db/leader.ts): starts nothing more and kills every job's process group at
+   * once, writing nothing. The new leader's recover() resumes or fails the jobs, as after a crash.
+   */
+  abandon(): void {
+    this.stopping = true;
+    for (const r of this.running.values()) if (r.child.pid) killGroup(r.child.pid, "SIGKILL");
+    // Model calls run in groups of their own; the jobs list theirs in their groups files.
+    killGroups([...this.running.keys()].map((id) => groupsFile(this.o.logs, id)));
   }
 
   /** Resolves when every running job has ended. */

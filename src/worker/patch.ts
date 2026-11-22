@@ -33,7 +33,7 @@ export function repositoryShaped(dir: string): boolean {
 // The ceiling keeps git from finding a repository above the source dir, where it would skip every path outside the working directory's prefix.
 function git(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) =>
-    execFile("git", [...UNTRUSTED_TREE, ...args], { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024, env: { PATH: process.env.PATH ?? "", HOME: "/nonexistent", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_NOSYSTEM: "1", LC_ALL: "C", GIT_CEILING_DIRECTORIES: dirname(cwd) } }, (err, stdout, stderr) =>
+    execFile("git", [...UNTRUSTED_TREE, ...args], { cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "", HOME: "/nonexistent", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_NOSYSTEM: "1", LC_ALL: "C", GIT_CEILING_DIRECTORIES: dirname(cwd) } }, (err, stdout, stderr) =>
       resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr || (err ? err.message : "")) }),
     ),
   );

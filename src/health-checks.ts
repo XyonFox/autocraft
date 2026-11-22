@@ -1,7 +1,7 @@
 // Health checks computed from the database: one list read by the dashboard's warnings menu and by GET /healthz/checks.
 // Every check reads rows the runner, the sync and the build workers already write; none starts work or wakes the planner.
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { listAccounts } from "./agents/accounts.ts";
+import { accountListOrNull } from "./agents/account-actions.ts";
 import { deadlineStops } from "./runner/autopilot.ts";
 import { stepTitle } from "./dash/api/trace.ts";
 import { repoErrors } from "./sync-errors.ts";
@@ -20,11 +20,15 @@ import { manualExpr } from "./remote/manual-only.ts";
 import { confidentialReadyAt, privateStepExpr } from "./build/tasks.ts";
 import type { Db } from "./db/index.ts";
 import { setting } from "./settings-read.ts";
+import { BEAT_MS, leaderStatus } from "./db/leader.ts";
+import { LEADER_ROLES } from "./db/fence.ts";
 
 /** Thresholds, in one place. */
 export const THRESHOLDS = {
   /** The runner writes its heartbeat every few seconds. */
   runnerStaleMs: 2 * 60_000,
+  /** The leader of the runner and of the periodic chores writes its status every BEAT_MS; standbys too. */
+  leaderStaleMs: 6 * BEAT_MS,
   /** A build worker polls at least every few seconds while it runs. */
   workerStaleMs: 5 * 60_000,
   /** A queued build task older than this has had time to be claimed. */
@@ -79,6 +83,31 @@ async function runnerCheck({ db, nowMs }: CheckCtx): Promise<Check[]> {
   if (!Number.isNaN(beat) && nowMs - beat <= THRESHOLDS.runnerStaleMs) return [ok("runner", "/pipeline")];
   const text = Number.isNaN(beat) ? "The runner has not reported" : `The runner has not reported for ${minutes(nowMs - beat)}`;
   return [{ id: "runner", state: "fail", text, brief: text, since: hb, to: "/pipeline" }];
+}
+
+/**
+ * Leader election on Postgres (src/db/leader.ts): `runner-leader` and `periodic-leader` are ok while a leader writes its
+ * status, with `since` its start and `count` the standbys waiting; a standby is not a problem unless a copy is set to one
+ * replica (warn). No row: one process, no check.
+ */
+async function leaderChecks({ db, nowMs }: CheckCtx): Promise<Check[]> {
+  const out: Check[] = [];
+  for (const role of LEADER_ROLES) {
+    const s = await leaderStatus(db, role, THRESHOLDS.leaderStaleMs, nowMs);
+    if (!s) continue;
+    const id = `${role}-leader`, at = s.leader ? Date.parse(s.leader.at) : NaN;
+    const name = role === "runner" ? "runner" : "periodic chores (sync)";
+    if (!Number.isNaN(at) && nowMs - at <= THRESHOLDS.leaderStaleMs) {
+      if (s.unwatched) {
+        const text = `A standby of the ${name} runs while AUTOCRAFT_RUNNER_REPLICAS is 1, so the leader runs without the watchdog two copies need; set it to the number of copies`;
+        out.push({ id, state: "warn", text, brief: `The ${name} copies are misconfigured`, since: s.leader!.since, count: s.standbys, to: "/pipeline" });
+      } else out.push(ok(id, "/pipeline", { since: s.leader!.since, count: s.standbys }));
+      continue;
+    }
+    const text = `No copy of the ${name} has reported as leader for ${Number.isNaN(at) ? "a while" : minutes(nowMs - at)}${s.standbys ? `; ${s.standbys} standby waiting` : ""}`;
+    out.push({ id, state: "fail", text, brief: text, since: s.leader?.at ?? null, count: s.standbys, to: "/pipeline" });
+  }
+  return out;
 }
 
 type Env = { id: string; label: string; kind: string; last_seen_at: string | null; created_at: string; health: string | null; health_at: string | null };
@@ -180,7 +209,9 @@ async function syncRepoChecks({ db }: CheckCtx): Promise<Check[]> {
 }
 
 async function accountsCheck({ db, nowMs, probe }: CheckCtx): Promise<Check[]> {
-  const on = (await listAccounts(db, nowMs, !probe)).filter((a) => a.enabled);
+  const all = await accountListOrNull(db, nowMs, !probe);
+  if (!all) return [{ id: "accounts", state: "warn", text: "The runner did not answer, so the Claude accounts are unknown", brief: "Claude accounts unknown: the runner did not answer", since: null, to: "/accounts" }];
+  const on = all.filter((a) => a.enabled);
   if (on.length && on.every((a) => a.pausedReason || a.auth.loggedIn === false)) {
     const text = on.length === 1 ? "The Claude account is paused" : "All Claude accounts are paused";
     return [{ id: "accounts", state: "fail", text, brief: text, since: null, to: "/accounts" }];
@@ -328,7 +359,7 @@ async function remoteNoTakerCheck({ db, nowMs, mode }: CheckCtx): Promise<Check[
 }
 
 /** Every check, in the order the lists show them. */
-const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, livenessCheck, appIdentityChecks, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck];
+const SOURCES: ((ctx: CheckCtx) => Promise<Check[]>)[] = [runnerCheck, leaderChecks, workerChecks, queueCheck, confidentialCheck, syncCheck, syncRepoChecks, accountsCheck, rateCheck, deadlineChecks, livenessCheck, appIdentityChecks, authorIdsCheck, outsideSurgeCheck, remoteCallsCheck, remoteStarvedCheck, remoteManualCheck, remoteNoTakerCheck];
 
 export async function computeChecks(db: Db, nowMs: number = Date.now(), probe = false): Promise<Check[]> {
   const mode = await inferenceMode(db);

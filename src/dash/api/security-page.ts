@@ -1,6 +1,8 @@
 // The Security list and the finding page. Staff only; everyone else gets 404, as the other security endpoints do. A
 // finding's open question is built here from its state (never stored as a decision), and answers go to
 // `POST /api/security/findings/:repo/:n`.
+import { OPERATOR_ACTIONS } from "./security.ts";
+import { mayRunRepo } from "../repo-access.ts";
 import type { ChoiceCore, Decision, DecisionChoices, FindingAction, FindingSeverity, FindingState, FindingView } from "../../../web/src/api/types.ts";
 import { FIX_ROUNDS } from "../../security/rules.ts";
 import { findingRow, INTERNAL_FINDING_STATES, reconcileFindings, toFinding, type FindingRow as StoredFinding } from "../../security/store.ts";
@@ -135,8 +137,8 @@ function rounds(f: FindingView, log: LogRound[], live: LiveRound[]): FixRound[] 
 }
 
 /** The finding's open question in the shape decisions use, built from its state. The recommendation stays empty: no model gives one. */
-function synthesize(f: FindingView, row: StoredFinding, status: ItemStatus, rounds: number | null, canSettle: boolean): { decision: Decision | null; choices: DecisionChoices | null } {
-  const actions = findingActions({ state: f.state, urgent: f.urgent });
+function synthesize(f: FindingView, row: StoredFinding, status: ItemStatus, rounds: number | null, canSettle: boolean, operator: boolean): { decision: Decision | null; choices: DecisionChoices | null } {
+  const actions = findingActions({ state: f.state, urgent: f.urgent }).filter((a) => operator || !OPERATOR_ACTIONS.includes(a));
   if (!actions.length) return { decision: null, choices: null };
   const again = f.state === "new" && row.fix_attempts > 0;
   const id = `${f.repo}:finding:${f.number}:security`;
@@ -166,7 +168,7 @@ export async function findingPage(db: Db, req: Req): Promise<FindingPageData> {
   const log = await logRounds(db, repo, n);
   const live = await liveRounds(db, repo, n);
   const row = rowOf(stored, log, live);
-  const { decision, choices } = synthesize(finding, stored, row.status, lastAttemptRounds(log.filter((l) => l.attempt === stored.fix_attempts)), req.user.role === "operator");
+  const { decision, choices } = synthesize(finding, stored, row.status, lastAttemptRounds(log.filter((l) => l.attempt === stored.fix_attempts)), await mayRunRepo(req.user, repo), req.user.role === "operator");
   return {
     finding, decision, choices, status: row.status, attempts: stored.fix_attempts, rounds: rounds(finding, log, live), history: history(finding),
     costUsd: finding.timeline.reduce((s, c) => s + (c.costUsd ?? 0), 0),

@@ -126,7 +126,7 @@ export async function refuseChangesRequested(repo: string, pr: string, gh: Gh): 
 export async function ghExec(args: string[]): Promise<string> {
   const env = await readEnvFor("gh", args);
   return new Promise((resolve, reject) => {
-    const p = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"], ...(env ? { env } : {}) });
+    const p = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, ...(env ? { env } : {}) });
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));

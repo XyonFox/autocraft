@@ -56,3 +56,33 @@ test("run reports exit codes, caps a large log, and background calls are waited 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("untar gives the same base commit for the same tree, and run prunes only ended calls older than a day", () => {
+  const dirs: string[] = [];
+  try {
+    const tar = join(tmpdir(), `ws-helper-src-${process.pid}.tar`);
+    const srcDir = mkdtempSync(join(tmpdir(), "ws-helper-src-"));
+    dirs.push(srcDir);
+    spawnSync("sh", ["-c", `echo hi > a.txt && tar -cf ${tar} a.txt`], { cwd: srcDir });
+    const bases = [0, 1].map(() => {
+      const root = mkdtempSync(join(tmpdir(), "ws-helper-"));
+      dirs.push(root);
+      const r = spawnSync("sh", [script, "untar"], { env: { ...process.env, WS_ROOT: root }, input: readFileSync(tar), encoding: "utf8", timeout: 20000 });
+      return r.stdout.split("\n")[0];
+    });
+    rmSync(tar, { force: true });
+    assert.match(bases[0]!, /^WS ok [0-9a-f]{40}$/);
+    assert.equal(bases[0], bases[1]);
+
+    const root = dirs[1]!;
+    const calls = join(root, ".ws/calls");
+    spawnSync("sh", ["-c", `mkdir -p ${calls} && cd ${calls} && for n in 1 2; do echo 0 > $n.exit; echo x > $n.log; echo 1 > $n.start; done; echo x > 3.log; echo 1 > 3.start; touch -d '3 days ago' 1.exit 1.log 1.start 3.start`]);
+    const r = spawnSync("sh", [script, "run", "9", "10", "--", "true"], { env: { ...process.env, WS_ROOT: root }, encoding: "utf8", timeout: 20000 });
+    assert.equal(r.status, 0);
+    const left = spawnSync("ls", [calls], { encoding: "utf8" }).stdout.split("\n");
+    assert.ok(!left.includes("1.log") && !left.includes("1.exit"), "an old ended call is pruned");
+    assert.ok(left.includes("2.log") && left.includes("3.start"), "a recent and a running call stay");
+  } finally {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  }
+});

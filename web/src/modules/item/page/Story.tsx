@@ -17,7 +17,7 @@ import { clock, nowMs } from "../../../lib/format";
 import { formatCost } from "../../../lib/trace";
 import { githubCommitUrl } from "../../../lib/links";
 import { useUser } from "../../../shell/UserContext";
-import { canAct } from "../../../registry/permissions";
+import { canRun } from "../../../registry/permissions";
 import { localActions } from "../../decisions/state";
 import { markStarting } from "../starting";
 import { useJump } from "./ItemPage";
@@ -108,7 +108,7 @@ function Line({ e, d, conv, date, flash, nested }: { e: TimelineEntry; d: ItemPa
   const turn = e.kind !== "harness";
   const review = e.reviewId ? [d.reviews.latest, ...d.reviews.earlier].find((r) => r?.id === e.reviewId) ?? null : null;
   const cost = viewer ? null : formatCost(e.costUsd);
-  const operator = user.role === "operator" && canAct(user, [d.repo]);
+  const operator = canRun(user, d.repo);
   const hasDetail = !!(e.body || e.lines.length || e.calls.length || review || e.jobId !== null || e.commit || e.githubId || e.feedback);
   return (
     <StoryLine

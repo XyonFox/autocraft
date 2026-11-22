@@ -49,6 +49,7 @@ The image sets every path (`/data/...`, `/config/...`). A deployment sets only t
 | `AUTOCRAFT_JEV_CLOUDFLARE_MODEL` | no | `typesafe/jev-1.14.0` | Workers AI model name. |
 | `GH_TOKEN` | yes, on dashboard, runner and periodic | none | GitHub token for `gh` (the dashboard's image proxy and repository adds, sync, pipeline calls): a classic token with `repo`, `read:org` and `workflow` scopes. Keep it in a Secret. |
 | `AUTOCRAFT_STOP_TIMEOUT` | no | `25` | Seconds the runner may take to stop. Keep the pod's `terminationGracePeriodSeconds` above it (30). |
+| `AUTOCRAFT_RUNNER_REPLICAS` | no | `1` | Copies of the runner and periodic containers the deployment runs; set it alike on both. With `1` a database outage never kills running jobs; with `2` or more a leader that has no successful lock check for 8 seconds stops its jobs so a standby can take over (operations.md, Two replicas). |
 | `AUTOCRAFT_HEALTH_LISTEN` | no | off | `host:port` of a runner listener that serves only `/healthz` and `/readyz`. |
 | `AUTOCRAFT_NO_SANDBOX` | no | off | `1` runs without bubblewrap, so without tool mode. Use it only if the cluster cannot allow the runner settings below. |
 | `AUTOCRAFT_REVIEW_BOTS` | no | `coderabbitai,dependabot,renovate` | Logins of review bots whose comments never make a review stale. Set it alike for dashboard, runner and periodic. |

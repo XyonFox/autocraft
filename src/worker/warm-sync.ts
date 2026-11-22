@@ -18,7 +18,7 @@ type Say = (msg: string) => void;
 const COMMIT = /^[0-9a-f]{7,64}$/;
 
 let zstdOk: Promise<boolean> | undefined;
-const hasZstd = () => (zstdOk ??= new Promise<boolean>((r) => execFile("zstd", ["--version"], (err) => r(!err))));
+const hasZstd = () => (zstdOk ??= new Promise<boolean>((r) => execFile("zstd", ["--version"], { windowsHide: true }, (err) => r(!err))));
 
 /** The signed statement: binds the snapshot bytes to the repo key, commit and main build time. */
 const BLOB_SLACK = 1024 * 1024;
@@ -110,7 +110,7 @@ async function download(cfg: WorkerConfig, key: string, say: Say): Promise<void>
     await pipeline(Readable.fromWeb(res.body as never), byteCap(rec.size + BLOB_SLACK), tap, createWriteStream(spool, { mode: 0o600 }), { signal: ac.signal });
     if (hash.digest("hex") !== rec.sha256) throw new Error("sha256 mismatch");
     mkdirSync(stage, { recursive: true, mode: 0o700 });
-    const zstd = spawn("zstd", ["-dc", spool], { stdio: ["ignore", "pipe", "ignore"] });
+    const zstd = spawn("zstd", ["-dc", spool], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     procs.push(zstd);
     const exit = new Promise<number | null>((r) => zstd.on("close", (code) => r(code)));
     zstd.on("error", () => ac.abort());
@@ -140,8 +140,8 @@ async function download(cfg: WorkerConfig, key: string, say: Say): Promise<void>
 /** Packs the warm dir into `file` (tar | zstd). Throws when either tool fails. */
 async function pack(dir: string, file: string, signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw new Error("aborted");
-  const tar = spawn("tar", ["-C", dir, "-cf", "-", "."], { stdio: ["ignore", "pipe", "ignore"] });
-  const zstd = spawn("zstd", ["-T0", "-3", "-q", "-f", "-o", file], { stdio: ["pipe", "ignore", "ignore"] });
+  const tar = spawn("tar", ["-C", dir, "-cf", "-", "."], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  const zstd = spawn("zstd", ["-T0", "-3", "-q", "-f", "-o", file], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
   const kill = () => [tar, zstd].forEach((c) => c.kill("SIGKILL"));
   signal.addEventListener("abort", kill, { once: true });
   try {
@@ -167,7 +167,7 @@ export async function uploadWarm(cfg: WorkerConfig, key: string, commit: string,
     const rec = await locked(key, async () => {
       const cur = readRecord(cfg, key);
       if (!cur || cur.commit !== commit) return null;
-      await new Promise<void>((resolve, reject) => execFile("cp", ["-al", dirOf(cfg, key), snap], (err) => (err ? reject(err) : resolve())));
+      await new Promise<void>((resolve, reject) => execFile("cp", ["-al", dirOf(cfg, key), snap], { windowsHide: true }, (err) => (err ? reject(err) : resolve())));
       return cur;
     });
     if (!rec) return say("warm store: local warm dir changed, upload skipped");

@@ -267,7 +267,7 @@ export function compose(core: Core, extras: ComposeExtra[], params: { reason?: s
 
 // ---- Store ------------------------------------------------------------------------
 
-type Raw = { id: string; decision_id: string; repo: string; number: number; turn_id: number | null; stamp: string; seen: string | null; source: string; drafts: string; added: string; pick: string; state: string; created_at: string };
+type Raw = { id: string; decision_id: string; repo: string; number: number; turn_id: number | null; stamp: string; seen: string | null; source: string; drafts: string; added: string; pick: string; state: string; created_at: string; asked_by: string | null };
 
 const json = <T>(s: string | null, fallback: T): T => {
   try { return s === null ? fallback : (JSON.parse(s) as T); } catch { return fallback; }
@@ -283,7 +283,7 @@ function rowOf(r: Raw): ChoicesRow {
     id: r.id, decisionId: r.decision_id, repo: r.repo, number: r.number, turnId: r.turn_id, stamp: r.stamp,
     seen: { head: seen.head ?? null, lastComment: seen.last_comment ?? null },
     source: r.source as ChoicesSource, drafts: Object.fromEntries(Object.entries(json<ChoicesRow["drafts"]>(r.drafts, {})).map(([k, v]) => [plainKey(k), v])), added: json<CoreKey[]>(r.added, []).map(plainKey),
-    pick: pick.core ? { ...pick, core: plainKey(pick.core) } : pick, state: r.state as ChoicesRow["state"], createdAt: r.created_at,
+    pick: pick.core ? { ...pick, core: plainKey(pick.core) } : pick, state: r.state as ChoicesRow["state"], createdAt: r.created_at, askedBy: r.asked_by,
   };
 }
 
@@ -312,7 +312,7 @@ export async function writeChoices(db: Db, row: Omit<ChoicesRow, "id" | "state" 
     await db.run(db.k.updateTable("main.decision_choices").set({ state: "replaced" }).where("decision_id", "=", row.decisionId).where("state", "=", "current"));
     await db.run(db.k.insertInto("main.decision_choices").values({
       id, decision_id: row.decisionId, repo: row.repo, number: row.number, turn_id: row.turnId, stamp: row.stamp, seen: seenJson(row.seen), source: row.source,
-      drafts: JSON.stringify(row.drafts), added: JSON.stringify(row.added), pick: JSON.stringify(row.pick), state: "current", created_at: at,
+      drafts: JSON.stringify(row.drafts), added: JSON.stringify(row.added), pick: JSON.stringify(row.pick), state: "current", created_at: at, asked_by: row.askedBy ?? null,
     }));
     const opt = row.pick.core ? parseCoreKey(row.pick.core) : null;
     // Backlog is an option of every decision, so a Later pick is the recommendation "backlog".
@@ -331,6 +331,8 @@ export async function writeChoices(db: Db, row: Omit<ChoicesRow, "id" | "state" 
 /** What a conversation turn's validated `choices` block changes. */
 export interface ChoicesUpdate {
   turnId: number | null;
+  /** The login whose message the reply answered. */
+  askedBy?: string | null;
   /** decisionStamp now. */
   stamp: string;
   seen: ChoicesRow["seen"];
@@ -370,6 +372,6 @@ export async function mergeChoices(db: Db, decisionId: string, u: ChoicesUpdate,
     }
     drafts[a.key] = { ...(a.draft.params && { params: a.draft.params }), extras: withIds(a.draft.extras) };
   }
-  const row = await writeChoices(db, { decisionId, repo, number, turnId: u.turnId, stamp: u.stamp, seen: u.seen, source: "conversation", drafts, added, pick: u.pick }, o);
+  const row = await writeChoices(db, { decisionId, repo, number, turnId: u.turnId, stamp: u.stamp, seen: u.seen, source: "conversation", drafts, added, pick: u.pick, askedBy: u.askedBy ?? null }, o);
   return { row, notes };
 }

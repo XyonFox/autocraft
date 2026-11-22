@@ -27,9 +27,7 @@ function Stat({ label, value, title }: { label: string; value: string; title?: s
 
 function WriteRow({ r, w, write }: { r: TrackedRepo; w: WriteKind; write: Write }) {
   const api = useApi();
-  const user = useUser();
-  const me = user.login;
-  const operator = user.role === "operator";
+  const me = useUser().login;
   const m = r[w.field];
   const key = `${w.field}:${r.name}`;
   return (
@@ -43,7 +41,7 @@ function WriteRow({ r, w, write }: { r: TrackedRepo; w: WriteKind; write: Write 
           </div>
         )}
       </div>
-      {operator ? (
+      {r.canManage ? (
         <Switch on={!!m?.approved} label={w.name} onChange={(on) => void write.run(key, () => w.run(api, r.name, on), { repo: r.name, patch: approvalPatch(w, on, me) })} />
       ) : m?.approved ? (
         <Badge tone="ok">Approved</Badge>
@@ -57,10 +55,9 @@ function WriteRow({ r, w, write }: { r: TrackedRepo; w: WriteKind; write: Write 
 /** On when every GitHub write of the repo is approved. Switching it on approves the rest in pipeline order; off stops them all. */
 function AllWrites({ r, write }: { r: TrackedRepo; write: Write }) {
   const api = useApi();
-  const user = useUser();
-  const operator = user.role === "operator";
+  const me = useUser().login;
   const key = `all:${r.name}`;
-  if (!operator) return null;
+  if (!r.canManage) return null;
   const all = WRITES.every((w) => r[w.field]?.approved);
   return (
     <span className="inline-flex items-center gap-3 text-sm text-ink/60">
@@ -75,7 +72,7 @@ function AllWrites({ r, write }: { r: TrackedRepo; write: Write }) {
             confirmed.add(w.field);
           }
           return out;
-        }, { repo: r.name, confirmed, patch: (cur) => Object.assign({}, ...todo.map((w) => approvalPatch(w, on, user.login)(cur))) });
+        }, { repo: r.name, confirmed, patch: (cur) => Object.assign({}, ...todo.map((w) => approvalPatch(w, on, me)(cur))) });
       }} />
     </span>
   );

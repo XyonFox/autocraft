@@ -102,31 +102,10 @@ spec:
             - { name: data, mountPath: /data }
             - { name: config, mountPath: /config }
         # Runs the work of the systemd sync timer (every minute after the previous run ends) and the
-        # daily backup timer (keeping 7), as one-shot commands of the same image.
+        # daily backup timer (keeping 7): deploy/periodic.sh, as one-shot commands of the same image.
         - name: periodic
           image: ghcr.io/storytold/autocraft@sha256:070416efcd1d986541c3fc395b949b85d93ba00145fbc85f54bb8909b30080d8
-          command:
-            - /usr/bin/tini
-            - --
-            - /bin/bash
-            - -c
-            - |
-              trap 'exit 0' TERM INT
-              # Time of the newest daily snapshot (0 when there is none), so a restart does not reset the schedule.
-              last_backup() {
-                f=$(ls -1t /data/backups/daily-*.db.* 2>/dev/null | head -n 1)
-                if [ -n "$f" ]; then stat -c %Y "$f"; else echo 0; fi
-              }
-              # A Postgres database (AUTOCRAFT_DB_URL) is backed up by its provider; the snapshot covers SQLite only.
-              snapshots=1
-              if [ -n "${AUTOCRAFT_DB_URL:-}" ]; then snapshots=0; echo "backup: AUTOCRAFT_DB_URL is set; no snapshots here, the database provider keeps the backups" >&2; fi
-              while true; do
-                /app/deploy/entrypoint.sh sync || echo "sync exited $?" >&2
-                if [ "$snapshots" = 1 ] && [ $(( $(date +%s) - $(last_backup) )) -ge 86400 ]; then
-                  /app/deploy/entrypoint.sh backup daily 7 || echo "backup exited $?" >&2
-                fi
-                sleep 60 & wait $!
-              done
+          args: ["periodic"]
           env:
             - name: GH_TOKEN
               valueFrom:

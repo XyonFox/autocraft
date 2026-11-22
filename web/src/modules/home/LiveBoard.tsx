@@ -222,7 +222,7 @@ const STEP_GROUPS = Object.keys(STEP_GROUP) as StepGroup[];
 
 const stepGroup = (step: string): StepGroup =>
   step.startsWith("security") ? "security"
-    : /^(fixissue|fixup|cifix|main-?fix|conflict|fix-)/.test(step) ? "fix"
+    : /^(implement|fixissue|fixup|cifix|main-?fix|conflict|fix-)/.test(step) ? "fix"
     : /review|^verify|^premerge|^postmerge|^referee/.test(step) ? "review"
     : /^(classify|dupes|prioritize|rank|areas|labels|details|embed)/.test(step) ? "triage"
     : /^(decide|merge|act$|conversation|close|unassign)/.test(step) ? "decide"

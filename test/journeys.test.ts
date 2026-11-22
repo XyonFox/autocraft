@@ -12,13 +12,12 @@ import { runCifix, type CifixDeps } from "../src/cifix/index.ts";
 import { runFixup, type FixupDeps } from "../src/fixup/index.ts";
 import type { Querier } from "../src/mirror.ts";
 import { storeArtifact, tempPath } from "../src/build/artifacts.ts";
-import { getTask } from "../src/build/tasks.ts";
 import { runDecide } from "../src/decide/index.ts";
 import { fillReviewSummaries } from "../src/review/summary.ts";
 import { prepareIds } from "../src/decide/prepare.ts";
 import { preparing } from "../src/decide/prepared.ts";
 import { ask, getDecision } from "../src/decisions.ts";
-import { attemptOf, runFixIssue, runFixIssueCollect, type CollectDeps } from "../src/fixissue/index.ts";
+import { setFeature } from "../src/build/features.ts";
 import { runAct } from "../src/act/index.ts";
 import { applyDuplicateAnswers } from "../src/dupes/decide.ts";
 import { runBatches } from "../src/merge/batch.ts";
@@ -478,50 +477,26 @@ describe("issue journey", () => {
     assert.equal((await w.db.all(w.db.k.selectFrom("decisions").select((eb) => eb.lit(1).as("one")).where("id", "=", "older").where("prepared_at", "is not", null).where("recommended", "=", "take"))).length, 1);
   });
 
-  test("a classified issue gets a scope decision; once an operator says take, a fix is built, checked and opened as a PR", async () => {
-    const lib = "crates/app/src/lib.rs", test = "crates/app/tests/autocraft_regression_5.rs";
-    const fix = `diff --git a/${lib} b/${lib}\n--- a/${lib}\n+++ b/${lib}\n@@ -1,3 +1,3 @@\n pub fn first(v: &[u8]) -> u8 {\n-    v[0]\n+    v.first().copied().unwrap_or(0)\n }\n`;
-    const newTest = `diff --git a/${test} b/${test}\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/${test}\n@@ -0,0 +1,4 @@\n+#[test]\n+fn empty_slice_does_not_panic() {\n+    assert_eq!(app::first(&[]), 0);\n+}\n`;
+  test("a classified issue gets a scope decision; once an operator says take and queues it, Implement plans it", async () => {
     const w = await (await (await fresh()).issue(5, { flags: ["needs decision"] })).models((input) => {
       if (input.includes("<decision>")) return `It reports a panic on an empty slice. The reference app has no such case.${choices({ pick: { core: null, reason: null } })}`;
     });
-    // Classified and flagged: the planner wants a scope decision and holds the fix back until it is answered.
+    // Classified and flagged: the planner wants a scope decision; nothing implements an issue nobody queued.
     const item = async () => (await w.plan()).items.find((i) => i.facts.number === 5)!.plan;
-    assert.deepEqual((await item()).actions.map((a) => a.kind).filter((k) => k === "decide" || k === "fixissue"), ["decide"]);
+    const kinds = async () => (await item()).actions.map((a) => a.kind).filter((k) => k === "decide" || k === "implement");
+    assert.deepEqual(await kinds(), ["decide"]);
     await runDecide(w.db, {}, quiet);
     const [decision] = await w.rows("SELECT id, answer FROM decisions WHERE kind = 'scope'");
     assert.equal(decision!.answer, null);
     assert.equal((await item()).state, "scope-open");
-    assert.equal((await item()).actions.some((a) => a.kind === "fixissue"), false);
 
     await w.answerDecision(String(decision!.id), "take");
-    assert.deepEqual((await item()).actions.map((a) => a.kind).filter((k) => k === "fixissue"), ["fixissue"]);
-
-    const g = issueWorld(w, { lib, fix: fix + newTest });
-    const started = await runFixIssue(w.db, { repo: "app", dryRun: false }, quiet, g.deps);
-    assert.deepEqual(started.started, ["app#5"]);
-    const a = (await attemptOf(w.db, "app", 5))!;
-    // The fix must fail on the base and pass on the head; the sandbox's results are recorded on its tasks.
-    // Round 1 passes the tests but clippy finds something on a line the patch changed: the round fails and round 2 sees the finding.
-    await endTask(w, a.head_task_id!, "pass");
-    await putLint(w, a.head_task_id!, { diagnostics: [{ line: 2 }], file: lib });
-    await endTask(w, a.base_task_id!, "fail-test");
-    assert.equal((await runFixIssueCollect(w.db, {}, quiet, g.deps)).failedRounds, 1);
-    assert.match((await attemptOf(w.db, "app", 5))!.summary!, /needless at line 2/);
-    const seen: string[] = [];
-    const ask0 = g.deps.ask;
-    g.deps.ask = async (db, id, input, ...rest) => { if (id === "fixissue.patch") seen.push(JSON.stringify(input)); return ask0(db, id, input, ...rest); };
-    await runFixIssue(w.db, { repo: "app", dryRun: false }, quiet, g.deps);
-    assert.match(seen[0]!, /"previous"[^]*needless at line 2/);
-    const b = (await attemptOf(w.db, "app", 5))!;
-    await endTask(w, b.head_task_id!, "pass");
-    await putLint(w, b.head_task_id!, { file: lib });
-    await endTask(w, b.base_task_id!, "fail-test");
-    const collected = await runFixIssueCollect(w.db, {}, quiet, g.deps);
-    assert.equal(collected.opened, 1);
-    assert.equal((await attemptOf(w.db, "app", 5))!.state, "pr-opened");
-    assert.deepEqual(g.prs.map((x) => x.head), ["pipeline-bot:autocraft/fix-5-panic-when-the-slice-is-empty"]);
-    assert.deepEqual(g.comments, ["A PR for this is in progress: https://github.com/storytold/app/pull/12."]);
+    assert.deepEqual(await kinds(), [], "take alone does not implement it");
+    // An operator queues it, and the repo's Implement switch is on: the plan step is due.
+    await w.db.run(w.db.k.insertInto("fast_track").values({ repo: "app", number: 5, added_by: "op", added_at: T1 }));
+    await setFeature(w.db, "implement", true, "op");
+    await setFeature(w.db, "implement", true, "op", "app");
+    assert.deepEqual((await item()).actions.filter((a) => a.kind === "implement").map((a) => a.params?.bucket), ["plan"]);
   });
 });
 
@@ -546,52 +521,6 @@ describe("CI fix journey", () => {
   });
 });
 
-/** An upstream repo and an empty fork on disk; git runs for real, gh is faked. Records the PRs opened and the issue comments. */
-function issueWorld(w: World, o: { lib: string; fix: string }) {
-  const root = tmpdir("issue");
-  const work = join(root, "work");
-  mkdirSync(join(work, "crates/app/src"), { recursive: true });
-  sh(work, "init", "-q", "-b", "main");
-  writeFileSync(join(work, o.lib), "pub fn first(v: &[u8]) -> u8 {\n    v[0]\n}\n");
-  sh(work, "add", "-A");
-  sh(work, "commit", "-q", "-m", "init");
-  const sha = sh(work, "rev-parse", "HEAD");
-  const upstream = join(root, "upstream.git"), fork = join(root, "fork.git");
-  sh(root, "clone", "-q", "--bare", work, upstream);
-  sh(root, "init", "-q", "--bare", fork);
-  const prs: { head: string }[] = [], comments: string[] = [];
-  let forked = false;
-  const out = (stdout: string, code = 0): ExecResult => ({ code, stdout, stderr: "" });
-  const run: Exec = async (cmd, args, opt = {}) => {
-    if (cmd === "gh") {
-      if (args[0] === "api" && args[1] === "user") return out(JSON.stringify({ login: "pipeline-bot", id: 42, node_id: "U42" }));
-      if (args[0] === "api" && args[1]!.startsWith("repos/pipeline-bot/")) return out("", forked ? 0 : 1);
-      if (args[0] === "api" && args[1]!.includes("/forks")) return out(forked ? "pipeline-bot/app\n" : "");
-      if (args[0] === "repo") { forked = true; return out(""); }
-      if (args[0] === "pr" && args[1] === "list") return out("");
-      if (args[0] === "pr") { prs.push({ head: args[args.indexOf("--head") + 1]! }); w.gh.writes.push({ kind: "pr", number: 12 }); return out("https://github.com/storytold/app/pull/12\n"); }
-      if (args[0] === "issue") { comments.push((opt.input ?? "").split("\n\n").at(-1)!); w.gh.writes.push({ kind: "comment", number: 5 }); return out(""); }
-      return out("", 1);
-    }
-    const urlAt = args.findIndex((a) => a.startsWith("https://github.com/"));
-    if (urlAt < 0) return exec("git", args, opt);
-    const target = args[urlAt]!.includes("/storytold/") ? upstream : fork;
-    if (args.includes("push")) w.gh.writes.push({ kind: "push", number: 5 });
-    const local = args.map((a, i) => (i === urlAt ? target : a)).filter((a, i, all) => a !== "protocol.file.allow=never" && !(a === "-c" && all[i + 1] === "protocol.file.allow=never"));
-    return exec("git", local, opt);
-  };
-  const deps: CollectDeps = {
-    exec: run, now: () => new Date(T1), root: join(root, "cache"), mainHead: async () => sha,
-    fetchCrates: async () => ({ ok: true, rust: true, crates: [{ name: "app", dir: "crates/app" }] }),
-    fetchPaths: async () => [o.lib, "README.md"],
-    ask: async (_db, id) => id === "fixissue.triage"
-      ? JSON.stringify([{ ref: "app#5", fixable: true, reason: "panics on an empty slice", crate: "app", files: [o.lib] }])
-      : id === "fixissue.check" ? JSON.stringify({ verdict: "approve", reasons: "fixes the cause", problems: [] }) : o.fix,
-    summarise: async () => "failed",
-  };
-  return { deps, prs, comments };
-}
-
 /** The sandbox finished a lint task: the formatter's diff (if it changed anything) and clippy's JSON lines come back as artifacts. */
 async function putLint(w: World, id: number, o: { format?: string; diagnostics?: { line: number }[]; file?: string } = {}): Promise<void> {
   const put = async (name: string, text: string) => { const tmp = tempPath(id); writeFileSync(tmp, text); await storeArtifact(w.db, id, name, tmp); };
@@ -603,18 +532,6 @@ async function putLint(w: World, id: number, o: { format?: string; diagnostics?:
 async function endLint(w: World, id: number, o: Parameters<typeof putLint>[2] = {}): Promise<void> {
   await putLint(w, id, o);
   await w.db.run(w.db.k.updateTable("build_tasks").set({ state: "done", results: "[]", ended_at: T1 }).where("id", "=", id));
-}
-
-/** The sandbox finished a build task: every step passed, or the test step failed. */
-async function endTask(w: World, id: number, end: "pass" | "fail-test"): Promise<void> {
-  const t = (await getTask(w.db, id))!;
-  const results = [];
-  for (const s of t.plan) {
-    const bad = end === "fail-test" && s.name === "test";
-    results.push({ step: s.name, exitCode: bad ? 101 : 0, durationMs: 1, timedOut: false });
-    if (bad) break;
-  }
-  await w.db.run(w.db.k.updateTable("build_tasks").set({ state: end === "pass" ? "done" : "failed", results: JSON.stringify(results), ended_at: T1 }).where("id", "=", id));
 }
 
 const sh = (cwd: string, ...args: string[]): string => {

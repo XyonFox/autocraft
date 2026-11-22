@@ -7,12 +7,12 @@ import { mapSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
 import { excluded, like, likeEscape } from "../db/kx.ts";
 
-export const BUILD_FEATURES = ["screenshots", "push-tests", "batch-build", "scan-tests", "nightly", "pr-builds"] as const;
+export const BUILD_FEATURES = ["screenshots", "push-tests", "batch-build", "scan-tests", "nightly", "pr-builds", "implement"] as const;
 export type BuildFeature = (typeof BUILD_FEATURES)[number];
 
 /** Repo-scoped features need the global switch and the repo's own switch. */
 export const REPO_SCOPED: Record<BuildFeature, boolean> = {
-  screenshots: true, "push-tests": true, "batch-build": true, "scan-tests": false, nightly: true, "pr-builds": true,
+  screenshots: true, "push-tests": true, "batch-build": true, "scan-tests": false, nightly: true, "pr-builds": true, implement: true,
 };
 
 export const isFeature = (s: unknown): s is BuildFeature => typeof s === "string" && (BUILD_FEATURES as readonly string[]).includes(s);

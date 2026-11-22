@@ -7,7 +7,6 @@ import { itemFacts } from "./world.ts";
 import { connectDb } from "../src/db/open.ts";
 
 const needsDecision = { classification: { flags: ["needs decision"] }, labels: { existing: ["bugfix", "needs decision"] } };
-const attempt = (state: string) => ({ state, textChanged: false, headDone: false, baseDone: true });
 
 test("a labelled issue with the needs-decision flag and no scope decision is asked", () => {
   const p = decideItem(itemFacts({ ...needsDecision, labels: { existing: ["bugfix", "needs decision"], labeledNote: "added: bugfix" } }));
@@ -20,17 +19,20 @@ test("a draft waits for its scope question and says so", () => {
   assert.equal(p.wait, "the scope question to be asked");
 });
 
-test("a skipped or failed fix attempt waits on a person", () => {
-  for (const s of ["skipped", "failed"]) {
-    const p = decideItem(itemFacts({ fix: { impact: "P2", attempt: attempt(s) } }));
-    assert.equal(p.wait, `a person to retry the ${s} fix`);
+const queued = (state: string, o: { textChanged?: boolean } = {}) => ({ queuedBy: "op", settles: true, featureOn: true, liveInRepo: 0,
+  row: { state, attempt: 1, textChanged: o.textChanged ?? false, newCommentAfterQuestion: false, decisionAnswered: false, requeuedAfterEnd: false, asked: null, prOpen: false } });
+
+test("a stuck or ended implementation waits on a person", () => {
+  for (const [s, wait] of [["stuck", "a decision on the stuck implementation"], ["failed", "a person to queue the implementation again"]]) {
+    const p = decideItem(itemFacts({ fix: { impact: "P2" }, implement: queued(s!) }));
+    assert.equal(p.wait, wait);
     assert.equal(p.waitKind, "person");
   }
 });
 
-test("a skipped attempt whose text changed is tried again, not waited on", () => {
-  const p = decideItem(itemFacts({ fix: { impact: "P2", attempt: { ...attempt("skipped"), textChanged: true } } }));
-  assert.deepEqual(p.actions.map((a) => a.kind), ["fixissue"]);
+test("an ended implementation whose issue text changed is started again, not waited on", () => {
+  const p = decideItem(itemFacts({ fix: { impact: "P2" }, implement: queued("failed", { textChanged: true }) }));
+  assert.deepEqual(p.actions.map((a) => [a.kind, a.params?.bucket]), [["implement", "plan"]]);
   assert.equal(p.wait, null);
 });
 
@@ -40,8 +42,8 @@ test("an issue whose fix PR is open waits on that PR (system)", () => {
   assert.equal(p.waitKind, "system");
 });
 
-test("an open PR waits the issue whatever its fix attempt state, and a mention says so", () => {
-  const stopped = decideItem(itemFacts({ fix: { impact: "P2", attempt: attempt("failed"), openPr: { number: 9, closes: true } } }));
+test("an open PR waits the issue whatever its implementation state, and a mention says so", () => {
+  const stopped = decideItem(itemFacts({ fix: { impact: "P2", openPr: { number: 9, closes: true } }, implement: queued("failed") }));
   assert.equal(stopped.wait, "open PR #9");
   const mention = decideItem(itemFacts({ fix: { impact: "P2", openPr: { number: 9, closes: false } } }));
   assert.equal(mention.wait, "open PR #9 mentions it");

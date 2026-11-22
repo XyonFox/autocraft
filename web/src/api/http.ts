@@ -154,6 +154,7 @@ export function createHttpApi(): Api {
       get: (repo, number) => get(conv(repo, number)),
       say: (repo, number, text, ask) => post(conv(repo, number, "/messages"), ask === false ? { text, ask: false } : { text }),
       include: (repo, number, source, on) => post(conv(repo, number, "/includes"), { source, on }),
+      withdraw: (repo, number) => post(conv(repo, number, "/withdraw")),
       editCard: (id, edit) => post(`/api/conversation-cards/${id}/edit`, edit),
       cancelPreapproval: (repo, n) => post(`/api/items/${repo}/${n}/preapproval/cancel`),
       retryPreapproval: (repo, n) => post(`/api/items/${repo}/${n}/preapproval/retry`),

@@ -7,6 +7,7 @@ import { decidePr } from "../src/core/decide.ts";
 import { guardRepo } from "../src/core/guard.ts";
 import type { AssignFacts } from "../src/core/plan.ts";
 import { claimForWork } from "../src/github/claim.ts";
+import { setFeature } from "../src/build/features.ts";
 import { runUnassign } from "../src/unassign/index.ts";
 import { world } from "./world-db.ts";
 import { itemFacts, prFacts } from "./world.ts";
@@ -59,15 +60,24 @@ test("a take-fix PR with a conflict give-up, an ended CI fix and a held merge ar
   assert.equal(unassigns(decidePr(prFacts({ lastMerge: { outcome: "refused", reason: "x", ci: "pending", mergeable: "MERGEABLE" }, assignment: ours }))), false, "refused merge retried");
 });
 
-test("an issue is unassigned when its fix gave up, kept while it is fixed, and never assigned by the planner", async () => {
-  const attempt = (state: string) => ({ attempt: { state, textChanged: false, headDone: false, baseDone: true } });
-  assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, fix: attempt("failed") }))), true);
-  assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, fix: attempt("testing") }))), false);
-  assert.equal(unassigns(decideItem(itemFacts({ assignment: { login: "bot", assignees: ["bot", "alice"], ours: true }, fix: attempt("failed") }))), false);
-  // A fix candidate nobody has worked on yet is not assigned: only a stage starting work does that.
+test("an issue is unassigned when its implementation waits on a person, kept while it runs, and never assigned by the planner", async () => {
+  const queued = (state: string) => ({ queuedBy: "op", settles: true, featureOn: true, liveInRepo: 0,
+    row: { state, attempt: 1, textChanged: false, newCommentAfterQuestion: false, decisionAnswered: false, requeuedAfterEnd: false, asked: null, prOpen: false } });
+  assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, implement: queued("stuck") }))), true);
+  assert.equal(unassigns(decideItem(itemFacts({ assignment: ours, implement: queued("implementing") }))), false);
+  assert.equal(unassigns(decideItem(itemFacts({ assignment: { login: "bot", assignees: ["bot", "alice"], ours: true }, implement: queued("stuck") }))), false);
+  // An issue queued by an operator is planned for Implement once the repo's switch is on; it is not assigned: only a stage starting work does that.
   const w = await (await (await world()).repo()).issue(5, { impact: "P2" });
-  assert.equal((await w.plan()).items[0]!.plan.actions.some((a) => a.kind === "fixissue"), true);
-  assert.equal((await w.plan()).items[0]!.plan.actions.some((a) => a.kind === "unassign"), false);
+  await w.db.run(w.db.k.insertInto("fast_track").values({ repo: "app", number: 5, added_by: "op", added_at: "2026-11-04T08:00:00.000Z" }));
+  const plan = async () => (await w.plan()).items.find((i) => i.facts.number === 5)!.plan;
+  const implement = async () => (await plan()).actions.filter((a) => a.kind === "implement" || a.kind === "unassign").map((a) => [a.kind, a.params?.bucket]);
+  assert.deepEqual(await implement(), [], "Implement off: nothing is planned");
+  await setFeature(w.db, "implement", true, "op");
+  await setFeature(w.db, "implement", true, "op", "app");
+  assert.deepEqual(await implement(), [["implement", "plan"]]);
+  // Queued by someone who does not settle on the repo: not queued for Implement.
+  await w.db.run(w.db.k.updateTable("fast_track").set({ added_by: "viewer" }).where("number", "=", 5));
+  assert.deepEqual(await implement(), []);
 });
 
 test("a stage assigns once; a person who removed us is final", async () => {

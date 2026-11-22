@@ -89,10 +89,10 @@ export async function pickerState(db: Db, user: Pick<Picker, "login" | "role">, 
 }
 
 /** A queued call as picks read it. */
-export type PickCall = { id: number; tier: Tier; promptId: string; parentId: number | null; repos: string[]; authors: ReadonlySet<string>; seenAt: number; pickedBy: string | null; pickUntil: number | null };
+export type PickCall = { id: number; tier: Tier; promptId: string; parentId: number | null; repos: string[]; authors: ReadonlySet<string>; seenAt: number; pickedBy: string | null; pickUntil: number | null; /** Lowercase login of the user whose own runners alone take it (calls.ts NewCall.forLogin). */ forLogin: string | null };
 
 /**
- * Why the user may not pick the call now, or null: only a queued call with a live caller, not a follow-up, not a judging
+ * Why the user may not pick the call now, or null: only a queued call with a live caller, bound to no user, not a follow-up, not a judging
  * call on the user's own item, not under another user's live pick, of a tier the user's runners cover, that the role rules
  * give the user and on whose every repo the user may write; and only below the user's most picks. `fresh`: whether a login's
  * picks count (pickerLogins).
@@ -102,6 +102,8 @@ export async function pickRefusal(state: PickerState, user: Picker, c: PickCall,
   const login = user.login.toLowerCase();
   if (c.pickedBy === login && await pickCounts(c, nowMs, fresh)) return "you picked it already";
   if (c.pickedBy !== null && await pickCounts(c, nowMs, fresh)) return "another user picked it";
+  if (c.forLogin === login) return "it runs on your Task Runner already";
+  if (c.forLogin !== null) return "it runs on the Task Runner of the person who asked";
   if (c.parentId !== null) return "a follow-up goes to the Task Runner that holds its session";
   if (c.seenAt < nowMs - CALLER_STALE_MS) return "its caller stopped waiting";
   if (!state.tiers.has(c.tier)) return `none of your Task Runners runs the ${c.tier} tier`;
@@ -113,13 +115,14 @@ export async function pickRefusal(state: PickerState, user: Picker, c: PickCall,
 }
 
 async function readCall(db: Db, id: number): Promise<(PickCall & { state: string; refs: ItemRef[] }) | null> {
-  const r = await db.get(db.k.selectFrom("main.remote_calls").select(["id", "state", "tier", "prompt_id", "parent_id", "items", "repo", "authors", "seen_at", "picked_by", "pick_until"]).$narrowType<{ tier: Tier }>().where("id", "=", id));
+  const r = await db.get(db.k.selectFrom("main.remote_calls").select(["id", "state", "tier", "prompt_id", "parent_id", "items", "repo", "authors", "seen_at", "picked_by", "pick_until", "for_login"]).$narrowType<{ tier: Tier }>().where("id", "=", id));
   if (!r) return null;
   const refs = JSON.parse(r.items) as ItemRef[];
   const authors = r.authors !== null ? JSON.parse(r.authors) as string[] : judges(r.prompt_id) ? await authorsOf(db, refs) : [];
   return {
     id: Number(r.id), state: r.state, tier: r.tier, promptId: r.prompt_id, parentId: r.parent_id, refs, repos: [...new Set([...refs.map((i) => i.repo), ...(r.repo ? [r.repo] : [])])],
     authors: new Set(authors.map((a) => a.toLowerCase())), seenAt: Number(r.seen_at), pickedBy: r.picked_by?.toLowerCase() ?? null, pickUntil: r.pick_until,
+    forLogin: r.for_login?.toLowerCase() ?? null,
   };
 }
 
@@ -140,7 +143,7 @@ export async function pickCall(db: Db, user: Picker, id: number, nowMs: number =
     // Parallel picks of one user cannot pass the most picks together.
     if (await livePicks(db, user.login, nowMs, id) >= state.pickMax) throw new HttpError(409, `you hold ${state.pickMax} picks, your most`);
     return Number((await db.run(db.k.updateTable("main.remote_calls").set({ picked_by: user.login, picked_at: nowMs, pick_until: cap === null ? null : nowMs + cap })
-      .where("id", "=", id).where("state", "=", "queued").where("parent_id", "is", null)
+      .where("id", "=", id).where("state", "=", "queued").where("parent_id", "is", null).where("for_login", "is", null)
       .where((eb) => eb.or([eb("picked_by", "is", null), eb("picked_by", "=", user.login), pickLapsedExpr(db, eb, nowMs)])))).changes);
   });
   if (changed !== 1) throw new HttpError(409, "another user picked it, or it is no longer queued");

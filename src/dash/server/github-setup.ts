@@ -3,6 +3,7 @@
 // creates the GitHub App in the org, optionally makes the operator an app
 // manager, and installs the app. The owner's token lives in memory for this
 // flow only: never written to the database, a log line or an audit row.
+import { boundAppKeys } from "../../github/app-keys.ts";
 import type { IncomingMessage } from "node:http";
 import type { GithubSetupLink } from "../../../web/src/api/types.ts";
 import { audit } from "../audit.ts";
@@ -219,7 +220,7 @@ export class OrgSetup {
     const later = (label: string) => steps.push(`<li class="later">${esc(label)}</li>`);
     const managerLabel = `Make ${flow.operator} an app manager`;
     if (app) done("Create GitHub App");
-    else if (!config.secretsFile) return message(nonce, 409, "AUTOCRAFT_SECRETS_FILE is not set, so there is nowhere to keep the app's keys.");
+    else if (!boundAppKeys(config.secrets)) return message(nonce, 409, "There is nowhere to keep the app's keys.");
     else {
       const name = envVar("GITHUB_APP_NAME") ?? DEFAULT_APP_NAME;
       const manifest = JSON.stringify(appManifest(name, publicBase(config, req)));

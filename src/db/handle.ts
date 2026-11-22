@@ -3,7 +3,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Compilable, DatabaseConnection, Kysely, TransactionBuilder } from "kysely";
 import type { DatabaseSync } from "node:sqlite";
-import type { DB, Db, DbEvent, Dialect, NamedParams, Param, Row, RunResult, Statement, WriteOptions } from "./index.ts";
+import type { DB, Db, DbEvent, Dialect, NamedParams, Param, Row, RunResult, Statement, Subscription, WriteOptions } from "./index.ts";
 
 export type Op = "get" | "all" | "run";
 export type Args = readonly (Param | NamedParams)[];
@@ -41,6 +41,14 @@ export interface Engine {
   scope(): Promise<Engine>;
   /** The transaction settings for `mode` (the driver turns them into its BEGIN). */
   configure(b: TransactionBuilder<DB>, mode: Tx["mode"]): TransactionBuilder<DB>;
+  /** A new listener on a connection of its own; absent where the backend has no notifications (SQLite). */
+  listener?(): Listener;
+  close(): Promise<void>;
+}
+
+/** Notifications from other connections: what `Db.listen` sits on. */
+export interface Listener {
+  listen(channel: string, fn: (payload: string | null) => void): Subscription;
   close(): Promise<void>;
 }
 
@@ -88,6 +96,8 @@ export class Handle implements Db {
   readonly #als = new AsyncLocalStorage<Tx>();
   readonly #observers = new Set<(e: DbEvent) => void>();
   readonly #warned = new Set<string>();
+  /** The handle's one listening connection, opened at the first listen; it outlives a scope() change of engine. */
+  #listener: Listener | undefined;
 
   constructor(make: (ctx: EngineContext) => Engine) {
     this.#engine = make({
@@ -228,7 +238,21 @@ export class Handle implements Db {
     return () => void this.#observers.delete(fn);
   }
 
-  close(): Promise<void> {
-    return this.#engine.close();
+  async notify(channel: string, payload: string): Promise<void> {
+    if (this.dialect !== "postgres") return;
+    await this.prepare("SELECT pg_notify(?, ?) AS n").get(channel, payload);
+  }
+
+  listen(channel: string, fn: (payload: string | null) => void): Subscription | null {
+    if (!this.#engine.listener) return null;
+    this.#listener ??= this.#engine.listener();
+    return this.#listener.listen(channel, fn);
+  }
+
+  async close(): Promise<void> {
+    const l = this.#listener;
+    this.#listener = undefined;
+    await l?.close();
+    await this.#engine.close();
   }
 }

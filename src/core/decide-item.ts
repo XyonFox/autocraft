@@ -1,11 +1,11 @@
 // decideItem: the triage rules of one open item (issue or PR) in one place: classify, referee, prioritize, embed, duplicates,
 // scope decision, label. Pure: no database, no clock (facts carry `now`). The rules are ported from the step selectors named at each rule.
 // decideAll adds a PR's review-to-merge Plan (decide.ts) and derives the Work page's next-step text.
-import { levelWith, type Level } from "../priority/score.ts";
+import { BUILD_STATES, ENDED_STATES, MAX_LIVE_PER_REPO, type ImplementBucket, type ImplementationState } from "../implement/types.ts";
 import { isWork, unassignActions } from "./assignment.ts";
 import { decidePr } from "./decide.ts";
 import { RECOMMEND_MAX_FAILURES, RECOMMEND_RETRY_MS, alreadyLabeled, isScope, labelsToAdd } from "./item-rules.ts";
-import type { Action, ItemFacts, ItemPlan, ItemState, ItemView, PassFacts, PrFacts } from "./plan.ts";
+import type { Action, ItemFacts, ItemPlan, ItemState, ItemView, PassFacts, PrFacts, WaitKind } from "./plan.ts";
 
 const act = (kind: Action["kind"], head: string | null, params?: Record<string, unknown>): Action => ({ kind, head, ...(params ? { params } : {}) });
 
@@ -17,15 +17,41 @@ export function scopeReason(f: ItemFacts): "needs-decision" | "scope-disagreemen
   return null;
 }
 
-/** An issue the Fix stage may start on: settled bugfix, not backlog priority, no attempt (a skipped one returns when its text changed), a public Rust repo, no scope call against it, no open PR that closes or mentions it. */
-function fixCandidate(f: ItemFacts): boolean {
-  const c = f.classification, fix = f.fix, a = fix.attempt;
-  if (!fix.publicRepo || fix.notRust || c.status !== "settled" || c.label !== "bugfix") return false;
-  if (fix.impact && levelWith(fix.impact as Level, c.flags.includes("security")) === "P4") return false;
-  if (a && !(a.state === "skipped" && a.textChanged)) return false;
-  const d = fix.scopeDecision;
-  if (d ? !(d.answer === "take" && d.byOperator) : c.flags.includes("needs decision")) return false;
-  return fix.openPr === null;
+/** The wait of a queued issue whose Implement feature is off for its repo. */
+export const implementOffWait = (repo: string): string => `Implement is off for ${repo}`;
+/** The wait of a queued issue whose latest attempt ended without a merged PR and whose text has not changed since. */
+export const IMPLEMENT_ENDED_WAIT = "a person to queue the implementation again";
+
+/**
+ * The Implement stage's step for an issue, or the wait that holds it; null when the issue is not queued (no fast_track
+ * row by someone who settles on the repo) or another rule says what it waits on (a hold, an open PR that closes or mentions it).
+ * A new attempt starts when there is none, or the last one ended and the issue text changed or it was queued again since; it needs the repo's
+ * Implement feature and room among the repo's live implementations. A question is planned again when its answer may have
+ * come: the issue text changed, a person commented after it, or its decision is answered.
+ */
+export function implementStep(f: ItemFacts): { bucket: ImplementBucket } | { wait: string; waitKind: WaitKind } | null {
+  const im = f.implement, row = im.row, fix = f.fix;
+  if (f.kind !== "issue" || !f.open || !f.inScope || f.held || im.queuedBy === null) return null;
+  const state = row?.state as ImplementationState | undefined;
+  const ended = !row || ENDED_STATES.has(state!);
+  if (!im.settles) return ended ? null : { wait: `a person who settles on ${f.repo} to queue it again`, waitKind: "person" };
+  const due = (bucket: ImplementBucket) => (im.featureOn ? { bucket } : { wait: implementOffWait(f.repo), waitKind: "person" as const });
+  if (ended) {
+    if (fix.openPr !== null) return null;
+    if (row && !row.textChanged && !row.requeuedAfterEnd) return { wait: IMPLEMENT_ENDED_WAIT, waitKind: "person" };
+    if (im.featureOn && im.liveInRepo >= MAX_LIVE_PER_REPO) return { wait: `${im.liveInRepo} implementations already running in ${f.repo}`, waitKind: "system" };
+    return due("plan");
+  }
+  if (state === "planning") return due("plan");
+  if (state === "asked") {
+    if (row!.textChanged || row!.newCommentAfterQuestion || row!.decisionAnswered) return due("plan");
+    return row!.asked === "author" ? { wait: "the author's answer", waitKind: "contributor" } : { wait: "a maintainer's answer", waitKind: "person" };
+  }
+  if (BUILD_STATES.has(state!)) return due("build");
+  if (state === "revising") return due("revise");
+  if (state === "stuck") return { wait: "a decision on the stuck implementation", waitKind: "person" };
+  // pr-opened: the open PR is the wait (fix.openPr); a PR that closed unmerged leaves it to a person.
+  return row!.prOpen ? null : { wait: IMPLEMENT_ENDED_WAIT, waitKind: "person" };
 }
 
 /** Jev and Haiku chose different labels and it is not a scope call: a referee (Sonnet, then Opus when Sonnet was unsure) still has to settle it. An unsure Opus settles the label too and flags a scope decision. */
@@ -34,9 +60,9 @@ const labelDisagreement = (f: ItemFacts): boolean => f.classification.status ===
 /** A scope decision should be asked: the reason holds and no open decision, scope decision or Backlog answer covers the item. Labelling or a later stage does not suppress it. */
 const scopeNeeded = (f: ItemFacts): boolean => scopeReason(f) !== null && !f.scope.covered;
 
-/** The wait of an issue whose fix attempt was skipped or failed: Fix again, Backlog or Close on the item page (and Needs you > Stopped) clears it. */
 /** The wait of an open issue with nothing due and nothing to ask: it stays open as a request for anyone to pick up. */
 export const TRIAGE_WAIT = "an open request for a person to pick up";
+/** The wait of an issue whose fix attempt of the retired Fix stage was skipped or failed; the planner no longer gives it. */
 export const fixStoppedWait = (state: string): string => `a person to retry the ${state} fix`;
 
 const PLUGIN_WAIT = "stays open as a plugin candidate";
@@ -102,19 +128,16 @@ export function decideItem(f: ItemFacts): ItemPlan {
     if ((f.inScope || t.security || t.group) && !backlog && !t.waiting && (t.action === null || t.action === "failed")) actions.push(act("act", null, { bucket: t.kind, decisionId: t.decisionId, security: t.security, ...(t.group ? { group: true } : {}) }));
   }
   if (live && !backlog && f.kind === "pr" && f.closeReview && f.closeReview.atHead && !f.closeReview.asked) actions.push(act("act", f.closeReview.head, { bucket: "close", ask: true }));
-  // fixissue: a retry round, or a new candidate; a Backlog hold stops both.
-  // fixissue-collect: finished build tasks, or a passed fix to open.
-  const fix = f.fix, a = fix.attempt;
-  if (f.kind === "issue") {
-    if (f.inScope && !backlog && a?.state === "retry") actions.push(act("fixissue", null, { source: "retry" }));
-    else if (live && !f.held && fixCandidate(f)) actions.push(act("fixissue", null, { source: "new" }));
-    if (f.inScope && !backlog && a && ((a.state === "testing" && a.headDone && a.baseDone) || a.state === "passed")) actions.push(act("fixissue-collect", null, { source: a.state }));
-  }
+  // implement: a queued issue's next step (implementStep); the repo's fix-issue approval and the breaker are applied by gates().
+  const fix = f.fix, step = implementStep(f);
+  if (step && "bucket" in step) actions.push(act("implement", null, { bucket: step.bucket }));
 
-  // unassign (issues; a PR's is decided with its review-to-merge plan): kept while a fix attempt runs or its PR is open, released
-  // when the issue waits on a person, was given up or left the scope.
+  // unassign (issues; a PR's is decided with its review-to-merge plan): kept while an implementation is due or runs, or its PR is open;
+  // released when the issue waits on a person (a question, a stuck attempt, a switch), was given up or left the scope.
   if (f.kind === "issue") {
-    const running = ["retry", "testing", "passed"].includes(a?.state ?? "") || (a?.state === "pr-opened" && fix.openPr !== null);
+    const row = f.implement.row;
+    // A fix attempt of the retired Fix stage whose PR is open keeps it too, until that stage's code goes.
+    const running = (!!step && "bucket" in step) || (row?.state === "pr-opened" && fix.openPr !== null) || (fix.attempt?.state === "pr-opened" && fix.openPr !== null);
     actions.push(...unassignActions(f.assignment, f.open, !f.inScope || !!f.held || !running));
   }
 
@@ -123,10 +146,11 @@ export function decideItem(f: ItemFacts): ItemPlan {
   const base = actions.some(isWork) ? null : !f.inScope ? "not in scope" : state === "classified" && pluginPr(f) ? PLUGIN_WAIT : WAITS[state] ?? null;
   // An issue with nothing else due waits on the PR that closes it, or on a person when its fix attempt was skipped or failed.
   let wait = base, waitKind: ItemPlan["waitKind"] = base === null ? null : f.inScope && (state === "held-duplicate" || state === "scope-open") ? "person" : "system";
+  // A queued issue waits on what holds its implementation.
+  if (step && "wait" in step && f.open && actions.every((x) => !isWork(x))) { wait = step.wait; waitKind = step.waitKind; }
   if (wait === null && f.kind === "issue" && f.open && f.inScope && !backlog && !f.held && actions.every((x) => !isWork(x))) {
     if (fix.openPr !== null) { wait = `open PR #${fix.openPr.number}${fix.openPr.closes ? "" : " mentions it"}`; waitKind = "system"; }
-    else if (a?.state === "skipped" || a?.state === "failed") { wait = fixStoppedWait(a.state); waitKind = "person"; }
-    else if (state === "classified" && f.fix.openPr === null) { wait = TRIAGE_WAIT; waitKind = "system"; }
+    else if (state === "classified") { wait = TRIAGE_WAIT; waitKind = "system"; }
   }
   return { repo: f.repo, number: f.number, kind: f.kind, state, actions, wait, waitKind };
 }
@@ -145,12 +169,18 @@ export function nextStep(item: ItemPlan, f: ItemFacts, pr: PrFacts | null): stri
   if (item.state === "scope-due" && c.status === "disagree") return "Decide";
   const needsDecision = c.flags.includes("needs decision");
   if (f.kind === "issue") {
-    switch (f.fix.attempt?.state) {
-      case "retry": case "testing": return "Fix: in progress";
-      case "passed": case "pr-opened": return "Fix: pull request opened";
-      case "skipped": case "failed": return "Needs a person";
-      default: return c.label === "bugfix" && !needsDecision ? "Fix" : needsDecision ? "Decide" : "Triage by a person";
+    const im = f.implement, s = im.row?.state;
+    if (im.queuedBy !== null && im.settles) {
+      switch (s) {
+        case "planning": return "Implement: planning";
+        case "asked": return "Implement: waiting for an answer";
+        case "planned": case "implementing": case "checking": case "fixing": case "opening": case "revising": return "Implement: in progress";
+        case "pr-opened": return "Implement: pull request opened";
+        case "stuck": return "Needs a person";
+        default: return "Implement";
+      }
     }
+    return needsDecision ? "Decide" : "Triage by a person";
   }
   const o = pr && !pr.inScope ? pr.outside ?? null : null;
   const r = o ? o.review : pr?.review && pr.review.head === pr.head && !pr.review.stale ? pr.review.verdict : null;

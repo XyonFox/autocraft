@@ -4,7 +4,7 @@
 // labels are for operators only. Staff also get the worker view: one row per Task Runner (a person's own tokens; private ones share one
 // neutral row), box account (operators only) and Jev, with the model calls each ran in the last hour.
 import type { ItemRef, ItemShown, LiveBoard, LiveEstimate, LiveLane, LiveOp, LiveOpKind, LiveWorker } from "../../../web/src/api/types.ts";
-import { listAccounts } from "../../agents/accounts.ts";
+import { accountListOrNull } from "../../agents/account-actions.ts";
 import { STATUS_FRESH_MS } from "../../remote/helpers.ts";
 import { privateLogins } from "../../remote/runner-private.ts";
 import { privateStepExpr } from "../../build/tasks.ts";
@@ -270,7 +270,7 @@ async function workersOf(
   }
   if (operator) {
     const used = new Set(runs.map((r) => r.account_id));
-    for (const a of await listAccounts(db, nowMs, false)) {
+    for (const a of await accountListOrNull(db, nowMs, false) ?? []) {
       if (!a.enabled && !used.has(a.id)) continue;
       rows.set(`account:${a.id}`, {
         key: `account:${a.id}`, kind: "account", name: a.label, login: null, harness: "claude",

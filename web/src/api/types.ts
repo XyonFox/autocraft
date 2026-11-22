@@ -726,6 +726,8 @@ export interface User {
   role: Role;
   /** repos where GitHub grants write, maintain or admin */
   writeRepos: RepoName[];
+  /** repos the user runs: an operator on every repo, a maintainer where GitHub grants write; per-repo and per-item actions (releases, hold, fast track, areas, Backlog) show for these */
+  runRepos: RepoName[];
   /** Deployment setting `maintainer_writes`: maintainers with write access settle decisions on repos that use the app's identity. */
   maintainerWrites: boolean;
   /** Computed by the server: maintainers with write access settle now (`maintainer_writes` on and the app's identity), so Queue items is open to them. */
@@ -904,6 +906,10 @@ export interface TrackedRepo {
   seenChecks: string[];
   /** Whether the pipeline stages run on this repo; off means sync only. False for repos that are not tracked. */
   pipeline: boolean;
+  /** Whether the viewer may switch this repo's pipeline: an operator, or a maintainer with write access to the repo. */
+  canSwitch: boolean;
+  /** The caller may change the repo's GitHub-write approvals and optional checks (the same rule as canSwitch). */
+  canManage: boolean;
 }
 
 export interface AccessEntry {
@@ -982,12 +988,14 @@ export interface DiscordAccount {
 /** A live agent token of any login (operators see all of them). */
 export type AccessToken = McpToken & { login: string };
 export interface GithubAppStatus {
-  /** The app's keys are in the secrets file. */
+  /** The app's keys are stored and readable. */
   configured: boolean;
   /** The instance-wide GitHub identity: the box account, or the GitHub App (writes and dashboard sign-in). */
   identity: "box" | "app";
-  /** False when the server has no secrets file to keep the keys in. */
+  /** False when the server has nowhere to keep the keys. */
   canRegister: boolean;
+  /** Stored keys exist that this process cannot open (sealed with another session_key); registering needs the replace confirmation. */
+  keysUnreadable: boolean;
   defaultName: string;
   /** The session's CSRF token, for the registration form. */
   csrf: string;
@@ -1203,6 +1211,8 @@ export interface JobItem extends ItemRef, ItemShown {
 }
 
 export interface JobDetail extends Job {
+  /** The caller may cancel the job: an operator, or a maintainer with write access to its repo. The server sets it per request. */
+  canCancel: boolean;
   /** The items the job handled, in the order it handled them; hidden repos left out. */
   items: JobItem[];
   /** The end of the job's log, with anything token-like replaced; null for viewers. */
@@ -1222,9 +1232,14 @@ export interface JobFilter {
   offset?: number;
 }
 
+/**
+ * A stage's circuit breaker that tripped: on one repo (the stage works no item there until an operator, or a maintainer with write
+ * access to the repo, resumes it), or on every repo (`repo` null: broken pushes on several repos; an operator resumes it).
+ */
+export type StageTrip = { /** The breaker as resume takes it: `<stage>:<repo>` (implement:deckcraft), or `<stage>` for every repo. */ key: string; repo: RepoName | null; reason: string; since: string; /** Whether the viewer may resume it. */ canResume: boolean };
 export type StageLimit = { step: string; title: string; perDay: number | null; usedToday: number; pausedReason: string | null;
-  /** The circuit-breaker stage that paused this step (fixup, cifix, fixissue, merge); an operator resumes it. */
-  tripped?: string;
+  /** Where the step's push stage (fixup, cifix, implement, merge) tripped, oldest first: per repo (the step goes on for every other repo), or on every repo. */
+  trips?: StageTrip[];
   /** What the stage is doing when nothing pauses it: "running", "queued", or why it is not starting ("nothing to do", "waiting for CI on 3 PRs in x"). */
   status?: string | null };
 export type PipelineState = { /** The model that prepares every question's options and recommendation (the prepare step), and the models an operator may pick ("opus", "sonnet"). */ judgementModel: string; judgementModels: string[]; enabled: boolean; /** Switched to drain: no new jobs, jobs already running keep their writes; shown as "Draining". Never true with enabled. */ draining: boolean; changedBy: string | null; changedAt: string | null; heartbeat: string | null; limits: StageLimit[]; /** "repo#number" refs the pipeline is limited to; empty when there is no pilot. */ pilot: string[]; outside: OutsideState };
@@ -1840,11 +1855,11 @@ export type TaskBatch = { id: number; branch: string; fork: string | null; commi
 /** Image and CI-gate inputs a task ran with. Worker-sent: shown as plain text only. */
 export type SandboxEnv = { image: string; baseImage: string; packages: string[]; craftFontsRef: string | null; craftI18nRev: string | null };
 /** Worker-sent text: shown as plain text only, never as markup. */
-export type BuildTaskDetail = BuildTask & { /** null (with the patch) for viewers: staff only. */ logTail: string | null; logBytes: number; logTruncated: boolean; patch: string | null };
+export type BuildTaskDetail = BuildTask & { /** null (with the patch) for viewers: staff only. */ logTail: string | null; logBytes: number; logTruncated: boolean; patch: string | null; /** The caller may cancel the task: an operator, or a maintainer with write access to its repo. The server sets it per request. */ canCancel: boolean };
 export type TaskFilter = { state?: TaskState | "active"; env?: string; repo?: string; cursor?: string; limit?: number };
 export type TaskPage = { tasks: BuildTask[]; next: string | null };
 /** Queued and running tasks and the slots left over the online, enabled environments (the flowchart's Verify node). */
-export type BuildFeatureName = "screenshots" | "push-tests" | "batch-build" | "scan-tests" | "nightly" | "pr-builds";
+export type BuildFeatureName = "screenshots" | "push-tests" | "batch-build" | "scan-tests" | "nightly" | "pr-builds" | "implement";
 /** `repos` lists the repos whose own switch is on; scan-tests has none. */
 export type BuildFeatureState = { feature: BuildFeatureName; on: boolean; repoScoped: boolean; repos: string[] };
 export type PrBuildScope = "outside" | "all";
@@ -1860,7 +1875,8 @@ export type ScreenshotCommand = { doc: string; params: Record<string, Screenshot
 /** The operator-edited setup of one repo; also the body of PUT /api/build/screenshots/:repo. */
 export type ScreenshotConfigJson = { package: string; example: string; driver: "args" | "jsonl"; commands: Record<string, ScreenshotCommand>; ui_paths: string[]; size?: string };
 export type ScreenshotSetup = { repo: string; config: ScreenshotConfigJson; updatedBy: string; updatedAt: string };
-export type ScreenshotSetups = { setups: ScreenshotSetup[] };
+/** `manageable`: the repos whose setup the caller may change (an operator, or a maintainer with write access). */
+export type ScreenshotSetups = { setups: ScreenshotSetup[]; manageable: string[] };
 // ---- Nightly page (/api/nightly) ---------------------------------------------
 
 export type NightlyState = "queued" | "pass" | "fail" | "error" | "skipped" | "warn";
@@ -1874,7 +1890,7 @@ export type NightlyCheckRow = {
   crates: string[]; targets: string[]; cells: (NightlyCell | null)[];
 };
 export type NightlyBench = { name: string; unit: string; latest: number; /** Latest against the median of the 7 nights before it, in percent (positive = slower); null with too little history. */ deltaPct: number | null; points: number[]; at: string };
-export type NightlyRepo = { repo: string; on: boolean; nights: { runId: number; startedAt: string; sha: string }[]; checks: NightlyCheckRow[]; benches: NightlyBench[] };
+export type NightlyRepo = { repo: string; on: boolean; /** The caller may change the repo's nightly checks. */ canSelect: boolean; nights: { runId: number; startedAt: string; sha: string }[]; checks: NightlyCheckRow[]; benches: NightlyBench[] };
 export type NightlyGrid = { repos: NightlyRepo[] };
 export type NightlySeries = { repo: string; bench: string; unit: string; points: { sha: string; at: string; value: number }[] };
 export type NightlySelectInput = { repo: string; check: string; enabled: boolean; crates?: string[]; targets?: string[] };
@@ -2120,6 +2136,8 @@ export interface DecisionChoices {
   run?: { cardId: number; state: ConversationCardState; error?: string };
   source: "prepare" | "conversation" | "converted";
   at: string;
+  /** Source conversation: the login whose message to Opus led to this version. */
+  after?: string;
 }
 
 /** Body of `conversations.doChoice`. */
@@ -2133,8 +2151,8 @@ export interface DoChoiceBody {
 
 export interface ConversationTurn {
   id: number;
-  kind: "operator" | "opus" | "system";
-  /** The operator's login, "opus" or "system". */
+  kind: "operator" | "maintainer" | "opus" | "system";
+  /** The writer's login, "opus" or "system". */
   login: string;
   at: string;
   body: string;
@@ -2142,7 +2160,7 @@ export interface ConversationTurn {
   actions: ConversationCard[];
   /** Opus turns: why proposed cards were dropped. */
   notes: string[];
-  /** Operator turns: pending while Opus has not answered, failed when it gave no usable reply. */
+  /** Operator and maintainer turns: pending while Opus has not answered, failed when it gave no usable reply. */
   status?: "pending" | "answered" | "failed";
   error?: string;
 }
@@ -2152,8 +2170,12 @@ export interface Conversation {
   number: number;
   /** False when the item has no conversation yet; turns is then empty. */
   exists: boolean;
-  /** An operator message waits for Opus's reply. */
+  /** A person's message waits for Opus's reply. */
   pending: boolean;
+  /** The viewer may write to Opus here: an operator, or a maintainer with write access to the repo (their messages run on their own Task Runner). */
+  canTalk: boolean;
+  /** A maintainer's message waits for Opus and the viewer may withdraw it: an operator, or the maintainer who wrote it. */
+  canWithdraw: boolean;
   /** While a reply is being written: what Opus did last, up to five plain lines, newest last. */
   progress?: string[];
   startedBy: string | null;
@@ -2279,11 +2301,13 @@ export type NeedsFeedbackRow = {
   handled: boolean;
 };
 export type NeedsFeedbackPage = { rows: NeedsFeedbackRow[]; nextCursor: string | null };
-export type NeedsResume = { type: "trip"; stage: string } | { type: "link"; to: string } | { type: "retry"; decision: string } | { type: "fixes"; repo: RepoName } | { type: "outside"; author: string };
+export type NeedsResume = { type: "trip"; /** The breaker: `<stage>:<repo>`, or outside-surge. */ stage: string; /** Whether the viewer may resume it: an operator, or for a push breaker a maintainer with write access to its repo. */ canResume: boolean } | { type: "link"; to: string } | { type: "retry"; decision: string } | { type: "fixes"; repo: RepoName } | { type: "outside"; author: string };
 export type NeedsStoppedRow = {
   id: string;
   kind: "breaker" | "limit" | "account" | "act" | "fix-group" | "outside-group";
   title: string;
+  /** A breaker row of a push stage: the repo it stopped the stage on (absent: every repo, or not a push stage). */
+  repo?: RepoName;
   reason: string;
   since: string | null;
   /** A fix-group row: how many issues of the repo have a stopped fix. */
@@ -2486,6 +2510,10 @@ export type FindingState = "new" | "dismissed" | "backlog" | "fixing" | "ready" 
 export type FindingAction = "fix" | "dismiss" | "backlog" | "reopen" | "land" | "advisory" | "publish";
 
 export interface ScanView {
+  /** The caller may stop the scan and decide its findings (continuing stays with operators); the server sets it per request. */
+  canAct: boolean;
+  /** The caller may continue a capped scan with a new cap (same rule as starting one). */
+  canContinue: boolean;
   id: number;
   repo: string;
   /** The pinned commit of the default branch; null before the scan has fetched it. */
@@ -2557,7 +2585,12 @@ export interface FindingView extends FindingSummary {
   timeline: FindingCall[];
 }
 
-export interface SecurityOverview { scans: ScanView[]; findings: FindingSummary[] }
+export interface SecurityOverview {
+  /** The caller may start a scan on this repo (maintainers need a spend cap). */
+  canStart: boolean;
+  scans: ScanView[];
+  findings: FindingSummary[];
+}
 
 export type ScanAreaState = "pending" | "running" | "done" | "failed";
 export interface ScanArea { idx: number; name: string; risk: number; why: string | null; paths: string[]; state: ScanAreaState; costUsd: number }
@@ -2610,7 +2643,7 @@ export type MySettings = UserSettingsReply & { manualOnly: boolean; tasks: strin
 export type MySettingsChange = UserSettings & { manualOnly: boolean; tasks: string[]; taskItems: TaskItems; runnerPrivate: boolean };
 
 /** Why a queued model call waits, most specific first: picked by a user; waiting for the runner that holds its session; no runner ready for its tier; every ready runner is Manual only; every runner that may take it is busy; no ready runner's user can take calls on its repo; calls ahead of it. */
-export type ModelQueueWhyCode = "picked" | "session" | "no-runner" | "manual-only" | "busy" | "no-repo-access" | "task-off" | "items-off" | "behind";
+export type ModelQueueWhyCode = "picked" | "session" | "bound" | "bound-off" | "no-runner" | "manual-only" | "busy" | "no-repo-access" | "task-off" | "items-off" | "behind";
 
 /** One queued model call of the user-local inference mode, as GET /api/model-queue shows it to the signed-in user's role. */
 export interface ModelQueueCall {

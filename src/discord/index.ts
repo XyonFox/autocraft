@@ -2,6 +2,7 @@
 // are set; the runner starts it next to the worker server. See docs/pipeline.md.
 import { loadConfig, type Config } from "../dash/server/config.ts";
 import { TokenBox } from "../dash/server/crypto.ts";
+import { bindSecrets, processAppKeys } from "../github/app-keys.ts";
 import { githubIdentity } from "../github/identity.ts";
 import { providerFor } from "../dash/server/provider.ts";
 import { userForLogin } from "../dash/server/sessions.ts";
@@ -82,6 +83,8 @@ export function dispatcher(db: Db, keys: DiscordKeys, interactions: Interactions
 function installDecisionAlerts(db: Db, keys: DiscordKeys, rest: RestClient, interactions: Interactions, signal: AbortSignal, log: (l: string) => void): void {
   let config: Config | null = null;
   try { config = loadConfig(process.env); } catch (e) { log(`runner: Discord alerts use cached permissions only: ${(e as Error).message}`); }
+  const appKeys = processAppKeys();
+  if (config && appKeys) bindSecrets(config.secrets, appKeys);
   const box = config ? new TokenBox(config.secrets.sessionKey) : null;
   const provider = config ? providerFor(config, async () => await githubIdentity(db)) : null;
   const alerts = new DecisionAlerts({

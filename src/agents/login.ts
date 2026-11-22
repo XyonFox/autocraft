@@ -140,7 +140,7 @@ export async function startLogin(id: string, configDir: string, onDone?: () => v
   if (running) return running.info;
   // A wide terminal keeps the URL on one line. exec: killing the pty's shell kills the CLI.
   const cmd = `stty cols 1000 rows 50 2>/dev/null; exec ${shq(claudeBin())} ${kind === "token" ? "setup-token" : "auth login --claudeai"}`;
-  const child = spawn("script", ["-q", "-f", "-e", "-c", cmd, "/dev/null"], { env: childEnv(configDir, { BROWSER: "true" }), stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn("script", ["-q", "-f", "-e", "-c", cmd, "/dev/null"], { env: childEnv(configDir, { BROWSER: "true" }), stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
   const l: Live = { kind, configDir, onToken, child, info: { state: "starting", url: null, message: null, kind }, out: "", screen: "", abort: new AbortController(), timers: [], onDone };
   // Loaded here, not at the top: the build worker runs this code from a git archive without node_modules, and the CLI loads every module.
   if (kind === "token") l.term = new (await import("@xterm/headless")).default.Terminal({ cols: 1000, rows: 50, scrollback: 200, allowProposedApi: true });

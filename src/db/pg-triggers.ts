@@ -17,6 +17,8 @@ import { pgExpr } from "../core/pg-expr.ts";
 import { applyPgSchema, pgSchemaStamp, type PgQueryable } from "./pg-migrate.ts";
 import { translateSqlite } from "./pg-schema.ts";
 import { pgScopeSql, SCOPED_SCHEMA } from "./scoped.ts";
+import { splitStageTripsPg, TRIP_SPLIT_VERSION } from "./trip-split.ts";
+import { retireFixAttemptsPg } from "./fix-retire.ts";
 
 const OPS = ["INSERT", "UPDATE", "DELETE"] as const;
 type Op = (typeof OPS)[number];
@@ -163,7 +165,7 @@ END $$;`;
 /** The schema stamp a migrated Postgres database stores in settings: the schema file's stamp and the trigger and view generators. */
 export function pgStamp(): string {
   return createHash("sha256").update(pgSchemaStamp()).update(pgTriggerSql()).update(pgScopeSql("app")).update(PIN_SEARCH_PATH)
-    .update(JSON.stringify(BOOKKEEPING_COLUMNS)).digest("hex").slice(0, 16);
+    .update(JSON.stringify(BOOKKEEPING_COLUMNS)).update(`trip-split ${TRIP_SPLIT_VERSION}`).digest("hex").slice(0, 16);
 }
 
 /** A connection that returns rows: a pg Client. */
@@ -191,6 +193,8 @@ export async function migratePg(client: PgClient): Promise<void> {
     await client.query(pgTriggerSql(pgColumns(await rows(PG_COLUMNS_SQL) as { t: string; c: string }[])));
     await client.query(pgScopeSql((await rows("SELECT current_schema() AS s"))[0]!.s as string));
     await client.query(PIN_SEARCH_PATH);
+    await splitStageTripsPg(client);
+    await retireFixAttemptsPg(client);
     await client.query("INSERT INTO settings (key, value) VALUES ('schema_stamp', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value", [stamp]);
   }, {
     unless: async () => (await storedPgStamp(rows)) === stamp,

@@ -205,6 +205,16 @@ export const PLAN_INPUTS: PlanInput[] = [
     pg: { full: `r.pr_url IS NOT NULL AND ${PILOT_LIST_SET_PG}` },
   },
   {
+    // Refs, not a full pass: the rows a change can move are this issue's and, through the repo's live count, the repo's other queued issues.
+    table: "implementations", class: "cross", why: "An implementation attempt: its issue, and the repo's other open queued issues (live implementations per repo bound new attempts).",
+    refs: `SELECT r.repo AS repo, r.number AS number
+      UNION SELECT f.repo, f.number FROM fast_track f JOIN items fi ON fi.repo = f.repo AND fi.number = f.number WHERE f.repo = r.repo AND fi.state = 'OPEN' AND fi.kind = 'issue'`,
+  },
+  {
+    table: "implementation_rounds", class: "cross", why: "A round of an implementation: its issue (a question round sets who the attempt waits on and from when).",
+    refs: "SELECT m.repo AS repo, m.number AS number FROM implementations m WHERE m.id = r.implementation_id",
+  },
+  {
     table: "build_tasks", class: "cross", why: "A sandbox task's state: its item, and the fix attempt, fix-up, CI fix or conflict merge whose task it is.",
     columns: ["state", "repo", "number"],
     refs: `SELECT r.repo AS repo, r.number AS number
@@ -251,7 +261,7 @@ export const PLAN_INPUTS: PlanInput[] = [
   { table: "repo_permissions", class: "global", why: "Maintainers' write permission per repo: who settles decisions there." },
   { table: "author_ids", class: "global", why: "Author logins bound to account ids: tiers of every PR of the author." },
   { table: "whitelist_overrides", class: "global", why: "Operator tier overrides of an author." },
-  { table: "stage_trips", class: "global", why: "Tripped breakers, a fact of every item." },
+  { table: "stage_trips", class: "global", why: "Tripped breakers, per stage and repo (a fact of every item of the repo, like main_ci); trips are rare, so a full pass costs little." },
   { table: "main_ci", class: "global", why: "Default-branch CI per repo (red main)." },
   { table: "main_fixes", class: "global", why: "Fixes of a red default branch: the repo's main CI state and its own fix PR." },
   { table: "own_commits", class: "global", why: "Commits the pipeline pushed: whether a PR's head is its own work, through any push chain." },

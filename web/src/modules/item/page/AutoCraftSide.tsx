@@ -4,7 +4,7 @@ import { localActions, useLocal } from "../../decisions/state";
 import { useQuery } from "../../../api/client";
 import type { ItemPageData } from "../../../api/types";
 import { useUser } from "../../../shell/UserContext";
-import { canAct, canComment } from "../../../registry/permissions";
+import { canAct, canComment, canRun } from "../../../registry/permissions";
 import { HeldAnswers } from "../../decisions/AnswerHold";
 import { OpenQuestions, useItemDecisions } from "../ItemDecisions";
 import { ActionCard } from "../OpusCards";
@@ -29,7 +29,7 @@ export function AutoCraftSide({ d, flash }: { d: ItemPageData; flash: string | n
   // The folded choices come back once Opus's reply (new choices, a reply without any, or a failure) is in.
   useEffect(() => {
     if (!updating || !conv || conv.pending) return;
-    const failed = [...conv.turns].reverse().find((t) => t.kind === "operator")?.status === "failed";
+    const failed = [...conv.turns].reverse().find((t) => t.kind === "operator" || t.kind === "maintainer")?.status === "failed";
     if (opusTurns > updating.opusTurns || conv.choices?.id !== updating.choicesId || failed) localActions.stopUpdating(item);
   }, [updating, conv, opusTurns, item]);
   // Only the newest Opus turn's cards are live: a card that leaves the question open is a suggested reply.
@@ -45,7 +45,7 @@ export function AutoCraftSide({ d, flash }: { d: ItemPageData; flash: string | n
       <HeldAnswers ds={(ds ?? []).filter((x) => !x.dispute && !x.orphaned)} />
       {!updating && suggestions.length > 0 && (
         <section className="space-y-3" aria-label="Suggested follow-up">
-          {suggestions.map((a) => <ActionCard key={a.id} a={a} operator={canAct(user, [d.repo])} editInstructions={user.role === "operator"} className="" item={{ repo: d.repo, number: d.number }} />)}
+          {suggestions.map((a) => <ActionCard key={a.id} a={a} operator={canAct(user, [d.repo])} editInstructions={canRun(user, d.repo)} className="" item={{ repo: d.repo, number: d.number }} />)}
         </section>
       )}
       {open.length === 0 && <DisclosurePanel title="Evidence" summary="Review, checks and related items"><ItemEvidence d={d} /></DisclosurePanel>}
@@ -53,7 +53,7 @@ export function AutoCraftSide({ d, flash }: { d: ItemPageData; flash: string | n
         <Story d={d} flash={flash} conv={conv} />
         <div className="px-4 pb-4 md:px-5">
           <ErrorLine error={conversationError?.message} />
-          {conv && <Composer flush repo={d.repo} number={d.number} operator={user.role === "operator"} commenter={canComment(user)} exists={conv.exists} pending={conv.pending} feedbackOn={open.length === 1 ? open[0] : undefined} choices={choices} opusTurns={opusTurns} />}
+          {conv && <Composer flush repo={d.repo} number={d.number} talk={conv.canTalk} withdrawable={conv.canWithdraw} operator={user.role === "operator"} commenter={canComment(user)} exists={conv.exists} pending={conv.pending} feedbackOn={open.length === 1 ? open[0] : undefined} choices={choices} opusTurns={opusTurns} />}
         </div>
       </DisclosurePanel>
     </div>

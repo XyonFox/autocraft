@@ -6,9 +6,18 @@
 //   upload  (network `api`)   uploads the artifacts of the steps that ran
 //   disk    (first in every step pod) fails the pod when the task's volume holds more than the environment's size,
 //           which a local-path volume does not enforce itself
-import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+//   warm-restore  fills empty target / CARGO_HOME dirs from the warm store's newest signed version; a store or content
+//                 failure is a cold start (logged, dirs emptied again, bad blob in `badBlobs`, exit 0)
+//   warm-publish  publishes the target and CARGO_HOME dirs as a new version of the key
+//   warm-gc       deletes old manifests and unreferenced blobs from the warm store
+// Warm phases read AUTOCRAFT_WARM_* (warmOptions below). The store layout is in src/warm/store-client.ts.
+import type { KeyObject } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import type { PodTask } from "../build/tasks.ts";
+import { BadBlobError, clearDir, DEFAULT_EXCLUDES, loadEd25519, type Roots } from "../warm/manifest.ts";
+import { WarmStore } from "../warm/store-client.ts";
+import { checkServiceUrl } from "./config.ts";
 import { WorkerApi } from "./client.ts";
 import { gateInputs } from "./environment.ts";
 import { collectArtifacts, contentTypeOf } from "./executor.ts";
@@ -149,6 +158,130 @@ function diskPhase(e: PodEnv, limit: number): number {
   return 4;
 }
 
+/**
+ * AUTOCRAFT_WARM_* settings of the warm phases:
+ *   STORE_URL        WebDAV root for reads (restore)          STORE_WRITE_URL  WebDAV root for writes (publish, gc)
+ *   STORE_USER, STORE_PASSWORD  credentials for the write URL
+ *   KEY              warm key                                  VERIFY_KEYS      comma-separated public key PEM files
+ *   SIGNING_KEY      private key PEM file (publish)
+ *   TARGET, CARGO_HOME  the dirs to fill or publish; restore skips one that is unset. Publish them at the paths the
+ *                    build used: the manifest records them, and cargo's fingerprints only match at the same paths.
+ *   CHECKOUT, IMAGE, ENV_HASH  recorded in the manifest header; RUSTC_FILE holds `rustc -vV` output
+ *   REPO, COMMIT     default to the task file's repo and head
+ *   EXCLUDE          comma-separated exclusion patterns (default DEFAULT_EXCLUDES)
+ *   RECHECK          comma-separated sha256s a restore reported as badBlobs (publish repairs them)
+ *   GC_KEEP (3), GC_MIN_AGE_HOURS (24, publish uses it too), GC_CAP_GB (150)
+ * A configuration error fails every phase (exit 1); only store and content problems make warm-restore a cold start.
+ */
+function warmOptions(env: NodeJS.ProcessEnv, e: PodEnv) {
+  const v = (n: string) => env[`AUTOCRAFT_WARM_${n}`] || undefined;
+  const need = (n: string) => v(n) ?? fail(`AUTOCRAFT_WARM_${n} is required`);
+  const fail = (msg: string): never => {
+    throw new Error(msg);
+  };
+  const url = (n: string) => {
+    const u = need(n);
+    checkServiceUrl(u, `AUTOCRAFT_WARM_${n}`);
+    return u;
+  };
+  const dir = (n: string) => {
+    const d = v(n);
+    if (d !== undefined && !isAbsolute(d)) fail(`AUTOCRAFT_WARM_${n} must be an absolute path`);
+    return d;
+  };
+  const key = (n: string, kind: "public" | "private") => (f: string): KeyObject => {
+    try {
+      return loadEd25519(readFileSync(f.trim()), kind);
+    } catch (err) {
+      return fail(`AUTOCRAFT_WARM_${n}: cannot load ${f.trim()}: ${(err as Error).message}`);
+    }
+  };
+  const count = (n: string, dflt: number) => {
+    const x = Number(v(n) ?? dflt);
+    return Number.isFinite(x) && x > 0 ? x : fail(`AUTOCRAFT_WARM_${n} must be a positive number`);
+  };
+  const store = (write: boolean) => new WarmStore({
+    readUrl: write ? url("STORE_WRITE_URL") : url("STORE_URL"),
+    writeUrl: write ? url("STORE_WRITE_URL") : undefined,
+    auth: write ? { user: need("STORE_USER"), password: need("STORE_PASSWORD") } : undefined,
+    fetchImpl: e.fetchImpl,
+  });
+  const roots = (): Partial<Roots> => ({ target: dir("TARGET"), cargo: dir("CARGO_HOME") });
+  return {
+    v, need, store, roots, count,
+    key: () => need("KEY"),
+    verifyKeys: () => need("VERIFY_KEYS").split(",").filter((f) => f.trim()).map(key("VERIFY_KEYS", "public")),
+    signKey: () => key("SIGNING_KEY", "private")(need("SIGNING_KEY")),
+    list: (n: string) => (v(n) ?? "").split(",").map((x) => x.trim()).filter(Boolean),
+    exclude: () => (v("EXCLUDE") ? v("EXCLUDE")!.split(",").map((x) => x.trim()).filter(Boolean) : DEFAULT_EXCLUDES),
+  };
+}
+
+async function warmRestorePhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<number> {
+  const w = warmOptions(env, e);
+  const key = w.key();
+  const roots = w.roots();
+  const verifyKeys = w.verifyKeys();
+  const store = w.store(false);
+  const dirs = Object.values(roots).filter((d): d is string => d !== undefined);
+  const out = (o: object) => writeFileSync(e.message, JSON.stringify(o).slice(0, MESSAGE_MAX));
+  const cold = (summary: string, badBlobs: string[] = []) => {
+    e.log(`${summary}; cold start`);
+    out({ ok: true, warm: null, badBlobs, summary: summary.slice(0, 300) });
+    return 0;
+  };
+  if (!dirs.length) throw new Error("AUTOCRAFT_WARM_TARGET or AUTOCRAFT_WARM_CARGO_HOME is required");
+  // Only a dir that was empty is emptied again after a failure.
+  const busy = dirs.filter((d) => existsSync(d) && readdirSync(d).length);
+  if (busy.length) throw new Error(`${busy.join(", ")} is not empty`);
+  const t0 = Date.now();
+  try {
+    const r = await store.restore(key, roots, verifyKeys);
+    if (!r) return cold(`warm restore: the store has no version of ${key}`);
+    const s = r.stats;
+    const summary = `warm restore: ${key}@${r.latest.commit.slice(0, 12)}, ${s.files} files (${(s.bytes / 1024 ** 3).toFixed(2)} GB), ${s.fetched} fetched, ${s.linked + s.copied} linked or copied, in ${((Date.now() - t0) / 1000).toFixed(1)} s`;
+    e.log(summary);
+    out({ ok: true, warm: { key, commit: r.latest.commit, stored: r.latest.stored, image: r.manifest.header.image, envHash: r.manifest.header.envHash, files: s.files, bytes: s.bytes, fetched: s.fetched, fetchedBytes: s.fetchedBytes }, summary });
+    return 0;
+  } catch (err) {
+    try {
+      for (const d of dirs) if (existsSync(d)) clearDir(d);
+    } catch (cleanup) {
+      // Never let a build run on a partial tree.
+      const summary = `warm restore failed (${(err as Error).message}) and its partial tree could not be removed: ${(cleanup as Error).message}`;
+      e.log(summary);
+      out({ ok: false, summary: summary.slice(0, 300) });
+      return 1;
+    }
+    return cold(`warm restore failed: ${(err as Error).message}`, err instanceof BadBlobError ? [err.sha256] : []);
+  }
+}
+
+async function warmPublishPhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<number> {
+  const w = warmOptions(env, e);
+  const roots = w.roots();
+  if (!roots.target || !roots.cargo) throw new Error("AUTOCRAFT_WARM_TARGET and AUTOCRAFT_WARM_CARGO_HOME are required");
+  let task: PodTask | undefined;
+  if (!w.v("REPO") || !w.v("COMMIT")) task = JSON.parse(readFileSync(join(e.work, "task.json"), "utf8")) as PodTask;
+  const rustcFile = w.v("RUSTC_FILE");
+  const rustc = rustcFile && existsSync(rustcFile) ? readFileSync(rustcFile, "utf8").trim().slice(0, 4096) : null;
+  if (!rustc) e.log("warm publish: no rustc -vV output; the manifest records none");
+  const s = await w.store(true).publish({
+    key: w.key(), repo: w.v("REPO") ?? task!.repo, commit: w.v("COMMIT") ?? task!.headSha,
+    image: w.v("IMAGE") ?? null, rustc, envHash: w.v("ENV_HASH") ?? null, checkout: w.v("CHECKOUT") ?? null,
+    source: { target: roots.target, cargoHome: roots.cargo }, exclude: w.exclude(), signKey: w.signKey(), log: e.log,
+    recheck: w.list("RECHECK").filter((x) => /^[0-9a-f]{64}$/.test(x)), minBlobAgeMs: w.count("GC_MIN_AGE_HOURS", 24) * 3600_000,
+  });
+  writeFileSync(e.message, JSON.stringify({ ok: true, commit: s.latest.commit, files: s.files, bytes: s.bytes, blobs: s.blobs, uploaded: s.uploaded, uploadedBytes: s.uploadedBytes, repaired: s.repaired }));
+  return 0;
+}
+
+async function warmGcPhase(e: PodEnv, env: NodeJS.ProcessEnv): Promise<number> {
+  const w = warmOptions(env, e);
+  await w.store(true).gc({ verifyKeys: w.verifyKeys(), keep: Math.floor(w.count("GC_KEEP", 3)), minBlobAgeMs: w.count("GC_MIN_AGE_HOURS", 24) * 3600_000, capBytes: w.count("GC_CAP_GB", 150) * 1024 ** 3, log: e.log });
+  return 0;
+}
+
 export async function podPhase(phase: string | undefined, env: NodeJS.ProcessEnv = process.env, fetchImpl?: typeof fetch): Promise<number> {
   const e = { ...podEnv(env), ...(fetchImpl ? { fetchImpl } : {}) };
   try {
@@ -156,10 +289,13 @@ export async function podPhase(phase: string | undefined, env: NodeJS.ProcessEnv
     if (phase === "source") return await sourcePhase(e);
     if (phase === "upload") return await uploadPhase(e);
     if (phase === "disk") return diskPhase(e, Number(env.AUTOCRAFT_POD_DISK_LIMIT) || 0);
+    if (phase === "warm-restore") return await warmRestorePhase(e, env);
+    if (phase === "warm-publish") return await warmPublishPhase(e, env);
+    if (phase === "warm-gc") return await warmGcPhase(e, env);
   } catch (err) {
     e.log(`${phase} failed: ${(err as Error).message}`);
     return 1;
   }
-  e.log("usage: autocraft-server worker pod task|source|upload|disk");
+  e.log("usage: autocraft-server worker pod task|source|upload|disk|warm-restore|warm-publish|warm-gc");
   return 2;
 }

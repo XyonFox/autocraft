@@ -1,4 +1,5 @@
-// Opus conversations on items. Everyone who may see the repo reads them; only operators write, edit, run and dismiss.
+// Opus conversations on items. Everyone who may see the repo reads them. Operators write to Opus, and so do maintainers with
+// write access to the repo, whose messages run on their own Task Runners; cards are run, edited and dismissed by those who settle.
 import type { CardEdit, Conversation, ConversationCard, ConversationTurn, DecisionChoices } from "../../../web/src/api/types.ts";
 import { buttonLabel, cardEffect, cardLines, decisionStamp, dependsOnCode, headline, isSettling, openDecision, stepLine, validateCard, type CardParams } from "../../conversations/cards.ts";
 import { applyDrafts, choicesById, compose, coresFor, currentChoices, seenJson, type ComposeExtra, type Core } from "../../decide/choices.ts";
@@ -9,17 +10,39 @@ import { audit } from "../audit.ts";
 import * as kx from "../../db/kx.ts";
 import { NOTE_MAX } from "../../conversations/types.ts";
 import { cardDigest, cardOf, cardRepos, dismissCard, doCard, editCard, sweepRunningCards, type ActDeps, type CardRow } from "../../conversations/act.ts";
-import { ConversationError, addOperatorMessage, conversationOf, includesOf, pendingTurn, setInclude, staleOf, turnsOf, type IncludeRow, type StoreDeps } from "../../conversations/store.ts";
+import { ConversationError, addMessage, withdrawTurn, conversationOf, includesOf, pendingTurn, setInclude, staleOf, turnsOf, type IncludeRow, type StoreDeps } from "../../conversations/store.ts";
 import { HttpError } from "../server/util.ts";
-import type { Req } from "../types.ts";
+import type { Req, User } from "../types.ts";
 import { isQuiet } from "../../security/quiet.ts";
 import { canSeeInternals } from "./staff.ts";
 import { needVisible } from "./visible.ts";
 import { canSettleCached, requireSettle } from "../../settlers.ts";
+import { mayRunRepo } from "../repo-access.ts";
 import { mapSeq } from "../../async-seq.ts";
 import type { Db } from "../../db/index.ts";
+import { inferenceMode, tierOfModel } from "../../remote/mode.ts";
+import { CLAUDE_PROMPTS } from "../../prompts/index.ts";
+import { isEnabled, pauseReason } from "../../runner/autopilot.ts";
+
+const CONVERSATION_PROMPT_ID = "conversation.turn";
+/** The step that answers maintainers' messages (src/runner/steps.ts). */
+const MAINTAINER_STEP = "conversation-maintainer";
+import { ownTaker } from "../../remote/takers.ts";
 
 const isOperator = (req: Req): boolean => req.user.role === "operator";
+
+/**
+ * Whether the user may write to Opus on an item of `repo`: an operator, or a maintainer with write permission on the repo, read
+ * live as canSettle reads it (src/settlers.ts), while model calls run on users' own Task Runners, since a maintainer's turn runs
+ * on theirs. Talking writes nothing to GitHub, so the app-identity and maintainer-writes conditions of settling do not apply.
+ */
+export async function canTalk(db: Db, user: Pick<User, "role" | "canWrite">, repo: string): Promise<boolean> {
+  if (user.role === "operator") return true;
+  return await inferenceMode(db) === "user-local" && await mayRunRepo(user, repo);
+}
+
+/** The refusal of a maintainer's message to Opus while none of their Task Runners may take it (src/remote/takers.ts). */
+export const NO_OWN_RUNNER = "Your Task Runner must be connected and ready to ask Opus. You can still post without Opus.";
 
 async function guard<T>(f: () => Promise<T>): Promise<T> {
   try {
@@ -109,14 +132,14 @@ export async function choicesView(db: Db, repo: string, n: number): Promise<Deci
   return {
     id: row.id, decisionId: d.id, pick, cores: cores.map(strip),
     ...(run && { run: { cardId: run.id, state: run.state as NonNullable<DecisionChoices["run"]>["state"], ...(run.error && { error: run.error }) } }),
-    source: row.source, at: row.createdAt,
+    source: row.source, at: row.createdAt, ...(row.askedBy && { after: row.askedBy }),
   };
 }
 
 /** The conversation plus the maintainer posts shared with Opus. */
 export type ConversationView = Conversation & { includes: IncludeRow[] };
 
-export async function conversationView(db: Db, repo: string, n: number, who?: { login: string; role: string }): Promise<ConversationView> {
+export async function conversationView(db: Db, repo: string, n: number, who?: { login: string; role: string }): Promise<Omit<ConversationView, "canTalk" | "canWithdraw">> {
   // A card left Running by a crash must not show as running until the next restart.
   await sweepRunningCards(db);
   const c = await conversationOf(db, repo, n);
@@ -172,13 +195,20 @@ function ask(req: Req): boolean {
 }
 
 function needOperator(req: Req): void {
-  if (!isOperator(req)) throw new HttpError(403, "only operators write in conversations");
+  if (!isOperator(req)) throw new HttpError(403, "only operators share posts with Opus");
+}
+
+/** The conversation as the requester sees it, with whether they may write to Opus and withdraw the maintainer's message that waits. */
+async function viewFor(db: Db, req: Req, repo: string, n: number): Promise<ConversationView> {
+  const wait = await pendingTurn(db, repo, n);
+  const canWithdraw = wait?.kind === "maintainer" && (isOperator(req) || wait.login.toLowerCase() === req.user.login.toLowerCase());
+  return { ...await conversationView(db, repo, n, req.user), canTalk: await canTalk(db, req.user, repo), canWithdraw };
 }
 
 export async function getConversation(db: Db, req: Req): Promise<ConversationView> {
   const { repo, n } = itemOf(req);
   await needVisible(db, req, repo);
-  const view = await conversationView(db, repo, n, req.user);
+  const view = await viewFor(db, req, repo, n);
   return !canSeeInternals(req) && await isQuiet(db, repo, n) ? veilConversation(view) : view;
 }
 
@@ -188,23 +218,43 @@ function veilConversation(v: ConversationView): ConversationView {
   return { ...rest, turns: v.turns.map((t) => ({ id: t.id, kind: t.kind, login: t.login, at: t.at, body: "", actions: [], notes: [], ...(t.status && { status: t.status }) })), includes: [], choices: null };
 }
 
+/** Why a maintainer's message to Opus would not be answered now, or null: the pipeline is off or draining, its step is paused, or none of their Task Runners is ready. */
+async function ownAskRefusal(db: Db, login: string, repo: string): Promise<string | null> {
+  if (!await isEnabled(db)) return "The pipeline is off, so Opus cannot answer now. You can still post without Opus.";
+  const paused = await pauseReason(db, MAINTAINER_STEP, Date.now(), { backoff: false });
+  if (paused) return `Opus cannot answer now: ${paused}. You can still post without Opus.`;
+  return await ownTaker(db, login, { prompt_id: CONVERSATION_PROMPT_ID, repos: [repo], tier: tierOfModel(CLAUDE_PROMPTS[CONVERSATION_PROMPT_ID].models[0]!) }) ? null : NO_OWN_RUNNER;
+}
+
+/** A message to Opus, or with `ask: false` a post without asking. A maintainer's asked message runs on their own Task Runner, so it is refused while it would not be answered (ownAskRefusal). */
 export async function postMessage(db: Db, req: Req, deps?: StoreDeps): Promise<ConversationView> {
-  needOperator(req);
   const { repo, n } = itemOf(req);
   await needVisible(db, req, repo);
-  await guardAsync(() => addOperatorMessage(db, repo, n, req.user.login, text(req), deps, ask(req)));
-  return await conversationView(db, repo, n, req.user);
+  if (!await canTalk(db, req.user, repo)) throw new HttpError(403, "only operators, and maintainers with write access to the repository, write in conversations");
+  const kind = isOperator(req) ? "operator" : "maintainer", asking = ask(req), body = text(req);
+  const refused = kind === "maintainer" && asking ? await ownAskRefusal(db, req.user.login, repo) : null;
+  if (refused) throw new HttpError(409, refused);
+  await guardAsync(() => addMessage(db, repo, n, { login: req.user.login, kind }, body, deps, asking));
+  return await viewFor(db, req, repo, n);
+}
+
+/** Withdraws the maintainer's message that waits for Opus: an operator, or the maintainer who wrote it, so an item is never held by a message no runner takes. */
+export async function postWithdraw(db: Db, req: Req): Promise<ConversationView> {
+  const { repo, n } = itemOf(req);
+  await needVisible(db, req, repo);
+  await guard(async () => await withdrawTurn(db, repo, n, { login: req.user.login, operator: isOperator(req) }));
+  return await viewFor(db, req, repo, n);
 }
 
 /** Shares a maintainer post with Opus (`on`) or stops sharing it; the next asked message carries it. */
 export async function postInclude(db: Db, req: Req, deps?: StoreDeps): Promise<ConversationView> {
-  needOperator(req);
   const { repo, n } = itemOf(req);
   await needVisible(db, req, repo);
+  if (!(await mayRunRepo(req.user, repo))) throw new HttpError(403, "no write access to this repo");
   const b = req.json as { source?: unknown; on?: unknown } | null;
   if (!b || typeof b !== "object" || typeof b.source !== "string" || typeof b.on !== "boolean") throw new HttpError(400, "the body must be an object with a source and on (true or false)");
   await guard(async () => await setInclude(db, repo, n, b.source as string, b.on as boolean, req.user.login, deps));
-  return await conversationView(db, repo, n, req.user);
+  return await viewFor(db, req, repo, n);
 }
 
 /** The card, for someone who settles it on every repo it writes to (src/settlers.ts: an operator with write access, or a maintainer under its rule). */
@@ -220,8 +270,8 @@ async function needCard(db: Db, req: Req): Promise<CardRow> {
 export async function editCardText(db: Db, req: Req): Promise<ConversationCard> {
   const c = await needCard(db, req);
   const edit = cardEdit(req);
-  // The fix-up instructions go to the fix-up model: only an operator writes them.
-  if (edit.instructions !== undefined && !isOperator(req)) throw new HttpError(403, "only operators edit a fix-up's instructions");
+  // The fix-up instructions go to the fix-up model: only someone who runs the repo writes them.
+  if (edit.instructions !== undefined && !(await mayRunRepo(req.user, c.repo))) throw new HttpError(403, "no write access to edit a fix-up's instructions");
   return await cardView(db, await guard(async () => await editCard(db, c.id, req.user.login, edit)), req.user);
 }
 
@@ -344,7 +394,7 @@ async function pressChoices(db: Db, req: Req, claimed: () => void, deps?: ActDep
   });
   const drafted = core.params?.instructions ?? "";
   const params = { reason: body.params.reason ?? core.params?.reason, instructions: body.params.instructions ?? core.params?.instructions };
-  if (body.params.instructions !== undefined && body.params.instructions.trim() !== drafted.trim() && !isOperator(req)) throw new HttpError(403, "only operators edit a fix-up's instructions");
+  if (body.params.instructions !== undefined && body.params.instructions.trim() !== drafted.trim() && !(await mayRunRepo(req.user, row.repo))) throw new HttpError(403, "no write access to edit a fix-up's instructions");
   const composed = compose(core, extras, params);
   if ("note" in composed) throw new HttpError(400, composed.note);
   const v = await validateCard(db, row.repo, row.number, composed.card);

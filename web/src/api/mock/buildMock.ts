@@ -1,5 +1,6 @@
 // Build environments and tasks on fake data: a local sandbox, two remote servers (one paused for disk, one offline), a disabled one,
 // and a few dozen tasks in every state.
+import { mayRunMock } from "./adminMock";
 import type { Api } from "../client";
 import type { ItemShown, BuildEnv, BuildFeatureName, BuildFeatures, ScreenshotConfigJson, ScreenshotSetup, BuildTask, PrBuildScope, BuildTaskDetail, TaskResult, TaskState, TaskStep, User } from "../types";
 import { NOW, REPOS } from "./fixtures";
@@ -124,7 +125,7 @@ export function createBuildMock(me: User, changed: () => void): Pick<Api, "envs"
   const featureOn = new Set<string>(["screenshots", "screenshots:photocraft", "screenshots:pdfcraft", "pr-builds", "pr-builds:photocraft", "pr-builds:pdfcraft"]);
   const scopes: Record<string, PrBuildScope> = { pdfcraft: "all" };
   let perDay = 10;
-  const SCOPED: Record<BuildFeatureName, boolean> = { screenshots: true, "push-tests": true, "batch-build": true, "scan-tests": false, nightly: true, "pr-builds": true };
+  const SCOPED: Record<BuildFeatureName, boolean> = { screenshots: true, "push-tests": true, "batch-build": true, "scan-tests": false, nightly: true, "pr-builds": true, implement: true };
   const features = (): BuildFeatures => ({
     features: (Object.keys(SCOPED) as BuildFeatureName[]).map((feature) => ({
       feature, on: featureOn.has(feature), repoScoped: SCOPED[feature],
@@ -141,7 +142,7 @@ export function createBuildMock(me: User, changed: () => void): Pick<Api, "envs"
       commands: { snap: { doc: "Render the main window.", params: { size: { enum: ["1440x900", "1024x768"] } }, argv: ["--out", "{out}", "--size", "{size}", "--scale", "2"], capture: true }, open_doc: { doc: "Open a document by name.", params: { name: { chars: "A-Za-z0-9_. -", min: 1, max: 60 } }, argv: ["--open", "{name}"] } },
     },
   }];
-  const setupsOut = () => ({ setups: structuredClone(setups) });
+  const setupsOut = () => ({ setups: structuredClone(setups), manageable: [...new Set([...setups.map((x) => x.repo), "designcraft", "pdfcraft", "craft-libs"])].filter((r) => mayRunMock(me, r)) });
   const visible = (t: BuildTask) => me.role === "operator" || t.repo !== "vault";
   const operator = () => {
     if (me.role !== "operator") throw new Error("only operators change build environments");
@@ -222,7 +223,7 @@ export function createBuildMock(me: User, changed: () => void): Pick<Api, "envs"
         const t = TASKS.find((x) => x.id === taskId && visible(x));
         if (!t) throw new Error("no such task");
         const logged = t.state !== "queued";
-        const d: BuildTaskDetail = { ...t, logTail: logged ? LOG(t) : "", logBytes: logged ? LOG(t).length : 0, logTruncated: false, patch: t.patchBytes ? PATCH : null };
+        const d: BuildTaskDetail = { ...t, logTail: logged ? LOG(t) : "", logBytes: logged ? LOG(t).length : 0, logTruncated: false, patch: t.patchBytes ? PATCH : null, canCancel: mayRunMock(me, t.repo) };
         return wait(d);
       },
       async cancel(taskId) {

@@ -1,9 +1,13 @@
 // The per-lease tools of a remote call (src/remote/protocol.ts ROUTES.tool and ROUTES.mcp): the item tools over the
-// snapshot, the repo's reference documentation and the `check` build tool, each served only to a call whose bundle lists
-// its server. The dashboard runs them; `check` is relayed to the job process that holds the call's CheckTool.
+// snapshot, the repo's reference documentation, the `check` build tool and the workspace tools, each served only to a call
+// whose bundle lists its server. The first two and the tarball mounts read the runner's disk (the snapshot, the diff
+// cache, the reference index, the clones): the dashboard serves them itself when it shares that disk, and otherwise asks
+// the runner's worker API (AUTOCRAFT_RUNNER_URL, src/build/worker-api.ts /remote/), which checks the lease again. `check`
+// is relayed to the job process that holds the call's CheckTool, and the workspace tools to the job that owns the
+// workspace (src/build/workspace-relay.ts).
 import { spawn, type ChildProcess } from "node:child_process";
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
-import { finished, PassThrough, type Readable } from "node:stream";
+import { finished, PassThrough, Readable } from "node:stream";
 import { dirname, join } from "node:path";
 import { CHECK_SERVER } from "../checktool/bridge.ts";
 import { TOOL as CHECK_TOOL } from "../checktool/server/tool.ts";
@@ -16,9 +20,12 @@ import { diffCacheDir } from "../review/diff.ts";
 import { REFERENCE_SERVER } from "./bundle.ts";
 import { liveLease } from "./calls.ts";
 import { relayCheck } from "./check-relay.ts";
+import { relayWorkspaceCall } from "../build/workspace-relay.ts";
+import { WORKSPACE_SERVER, WORKSPACE_TOOLS, type WorkspaceToolResult } from "../build/workspace-tools.ts";
 import type { Mount, TaskBundle } from "./protocol.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { Db } from "../db/index.ts";
+import { envVar } from "../env.ts";
 
 export type { ToolResult };
 
@@ -54,7 +61,7 @@ const REFERENCE_TOOLS = [
 ];
 
 /** The tool definitions of each task server, as tools/list returns them. */
-export const TASK_TOOLS: Record<string, readonly unknown[]> = { [ITEM_SERVER]: ITEM_TOOLS, [CHECK_SERVER]: [CHECK_TOOL], [REFERENCE_SERVER]: REFERENCE_TOOLS };
+export const TASK_TOOLS: Record<string, readonly unknown[]> = { [ITEM_SERVER]: ITEM_TOOLS, [CHECK_SERVER]: [CHECK_TOOL], [REFERENCE_SERVER]: REFERENCE_TOOLS, [WORKSPACE_SERVER]: WORKSPACE_TOOLS };
 
 export type TaskLease = { id: number; runId: number | null; login: string; servers: string[]; mounts: Mount[]; referenceRepo: string | null };
 
@@ -155,23 +162,56 @@ function items(name: string, raw: unknown): ToolResult {
   return itemTool(db, { db: file, diffs: diffCacheDir() }, name, raw);
 }
 
+/** The runner's worker API, for a dashboard that does not share the runner's disk (AUTOCRAFT_RUNNER_URL); null: the files are local. */
+export const runnerUrl = (env: NodeJS.ProcessEnv = process.env): string | null => envVar("RUNNER_URL", env)?.replace(/\/+$/, "") || null;
+
+/** Tool calls the runner answers within this; the item and reference tools read files and an index, nothing slower. */
+const RUNNER_TOOL_TIMEOUT_MS = 60_000;
+
+/** Runs an item or reference tool on the runner, which checks the lease again. */
+async function runnerTool(base: string, secret: string, server: string, name: string, raw: unknown, signal?: AbortSignal): Promise<ToolResult> {
+  const timeout = AbortSignal.timeout(RUNNER_TOOL_TIMEOUT_MS);
+  const res = await fetch(`${base}/remote/tools/${server}/${name}`, {
+    method: "POST", headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" }, body: JSON.stringify(raw ?? {}),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  if (res.status === 401 || res.status === 410) return { text: "the lease is gone", isError: true };
+  if (!res.ok) throw new Error(`the runner answered ${res.status}`);
+  const r = (await res.json()) as { text?: unknown; isError?: unknown };
+  if (typeof r.text !== "string") throw new Error("the runner sent no tool result");
+  return { text: r.text, ...(r.isError === true && { isError: true }) };
+}
+
 /**
  * Runs one tool of `server` for the lease, which must list the server. Bad arguments and refusals come back as an error
- * result. `check` waits for the job process: `tick` is called about every 15 s meanwhile, and `signal` ends the wait.
+ * result. `check` and the workspace tools wait for a job process: `tick` is called about every 15 s meanwhile, and
+ * `signal` ends the wait. Only workspace tools return images.
  */
-export async function callTaskTool(db: Db, lease: TaskLease, secret: string, server: string, name: unknown, raw: unknown, opts: { signal?: AbortSignal; tick?: () => void } = {}): Promise<ToolResult> {
+export async function callTaskTool(db: Db, lease: TaskLease, secret: string, server: string, name: unknown, raw: unknown, opts: { signal?: AbortSignal; tick?: () => void; local?: boolean } = {}): Promise<WorkspaceToolResult> {
   const tools = TASK_TOOLS[server] as { name: string }[] | undefined;
   if (!tools || !lease.servers.includes(server)) return { text: `this call has no ${server} tools`, isError: true };
   if (typeof name !== "string" || !tools.some((t) => t.name === name)) return { text: `unknown tool ${JSON.stringify(name)}`, isError: true };
   try {
+    const runner = opts.local ? null : runnerUrl();
+    if (runner && (server === ITEM_SERVER || server === REFERENCE_SERVER)) return await runnerTool(runner, secret, server, name, raw, opts.signal);
     if (server === ITEM_SERVER) return await items(name, raw);
     if (server === REFERENCE_SERVER) return await reference(db, lease, name, raw);
-    return await relayCheck(db, { id: lease.id, runId: lease.runId }, raw, { live: async () => (await liveLease(db, secret))?.id === lease.id, ...opts });
+    const live = async (): Promise<boolean> => (await liveLease(db, secret))?.id === lease.id;
+    if (server === WORKSPACE_SERVER) return await relayWorkspaceCall(db, { id: lease.id, runId: lease.runId }, name, raw, { live, ...opts });
+    return await relayCheck(db, { id: lease.id, runId: lease.runId }, raw, { live, ...opts });
   } catch (e) {
     if (e instanceof BadArgs) return { text: e.message, isError: true };
     console.error(`task tool ${server}/${name}: ${(e as Error).stack ?? e}`);
     return { text: "the tool failed; the error is logged", isError: true };
   }
+}
+
+/** The runner's answer to a tarball request must begin within this. */
+const RUNNER_HEADERS_MS = 30_000;
+
+/** The runner no longer knows the lease (it ended while the dashboard asked). */
+export class LeaseGone extends Error {
+  constructor() { super("the lease is gone"); }
 }
 
 const ARCHIVE_SLOTS = 4;
@@ -206,7 +246,7 @@ function pruneArchives(dir: string, keep: string): void {
 
 const gitOk = (args: string[], env: NodeJS.ProcessEnv): Promise<boolean> =>
   new Promise((ok) => {
-    const p = spawn("git", [...HARDENING, ...args], { env, stdio: "ignore" });
+    const p = spawn("git", [...HARDENING, ...args], { env, stdio: "ignore", windowsHide: true });
     p.on("error", () => ok(false));
     p.on("close", (code) => ok(code === 0));
   });
@@ -215,10 +255,32 @@ const gitOk = (args: string[], env: NodeJS.ProcessEnv): Promise<boolean> =>
  * The tar stream of a tarball mount the lease's bundle lists, or null when the bundle has no such mount or our clone of
  * the repo lacks the commit. The stream ends normally only when the archive is complete; otherwise it is destroyed with
  * an error. Archives are cached on disk per repo and commit, and at most ARCHIVE_SLOTS `git archive` run at once.
- * Instruction files stay in; the helper removes them.
+ * Instruction files stay in; the helper removes them. Without the clones on this disk (`runnerUrl`, unless `local`) the
+ * runner streams it, authenticated by the lease's `secret`.
  */
-export async function archiveOf(lease: TaskLease, repo: string, sha: string): Promise<Readable | null> {
+export async function archiveOf(lease: TaskLease, repo: string, sha: string, opts: { secret?: string; local?: boolean; signal?: AbortSignal } = {}): Promise<Readable | null> {
   if (!lease.mounts.some((m) => m.kind === "tarball" && m.repo === repo && m.sha === sha)) return null;
+  const runner = opts.local ? null : runnerUrl();
+  if (runner) {
+    // The runner must start answering within RUNNER_HEADERS_MS; the body then streams for as long as the client reads it.
+    // `signal` (the client going away) ends either.
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error("the runner did not answer in time")), RUNNER_HEADERS_MS);
+    const stop = (): void => ac.abort(opts.signal?.reason);
+    opts.signal?.addEventListener("abort", stop, { once: true });
+    let res: Response;
+    try {
+      res = await fetch(`${runner}/remote/tarball?${new URLSearchParams({ repo, sha })}`, { headers: { authorization: `Bearer ${opts.secret ?? ""}` }, signal: ac.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (res.status === 401 || res.status === 410) { await res.body?.cancel(); throw new LeaseGone(); }
+    if (res.status === 404) { await res.body?.cancel(); return null; }
+    if (!res.ok || !res.body) { await res.body?.cancel(); throw new Error(`the runner answered ${res.status} for a tarball`); }
+    const out = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
+    out.on("close", () => opts.signal?.removeEventListener("abort", stop));
+    return out;
+  }
   const dir = archiveDir(), name = `${repo}@${sha}.tar`, file = join(dir, name);
   if (existsSync(file)) {
     const now = new Date();
@@ -241,7 +303,7 @@ export async function archiveOf(lease: TaskLease, repo: string, sha: string): Pr
     // A failed copy (disk full, the directory gone) is dropped; the client still gets its stream.
     let sinkFailed = false;
     sink.on("error", () => { sinkFailed = true; rmSync(tmp, { force: true }); });
-    git = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"] });
+    git = spawn("git", [...HARDENING, "archive", "--format=tar", sha], { env, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     git.stdout!.pipe(out, { end: false });
     git.stdout!.pipe(sink);
     git.on("error", () => { out.destroy(new Error("git archive failed")); sink.destroy(); rmSync(tmp, { force: true }); release(); });

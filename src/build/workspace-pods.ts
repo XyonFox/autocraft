@@ -14,7 +14,8 @@ export const DEFAULT_WORKSPACE_DEADLINE_SEC = 4 * 3600;
 
 export type WorkspaceLimits = { deadlineSec: number };
 
-export const workspaceName = (id: number): string => `ws-${id}`;
+/** The first pod and volume of workspace `id`; a resume names its new ones with `incarnation`, so an old one still shutting down never blocks them. */
+export const workspaceName = (id: number, incarnation?: string): string => (incarnation ? `ws-${id}-${incarnation}` : `ws-${id}`);
 export const workspaceEnvSelector = (envId: string): string => `app.kubernetes.io/name=${WORKSPACE_APP},craft.build/env=${envId}`;
 export const workspaceSelector = (id: number): string => `app.kubernetes.io/name=${WORKSPACE_APP},craft.build/workspace=${id}`;
 
@@ -29,21 +30,21 @@ export const workspaceEnv = (arch: KubeSettings["arch"]): Record<string, string>
   VK_ICD_FILENAMES: `/usr/share/vulkan/icd.d/lvp_icd.${arch}.json`, WGPU_BACKEND: "vulkan", LP_NUM_THREADS: "4",
 });
 
-export function workspacePvcSpec(s: KubeSettings, envId: string, id: number) {
+export function workspacePvcSpec(s: KubeSettings, envId: string, id: number, name = workspaceName(id)) {
   return {
     apiVersion: "v1", kind: "PersistentVolumeClaim",
-    metadata: { name: workspaceName(id), namespace: s.namespace, labels: labels(envId, id) },
+    metadata: { name, namespace: s.namespace, labels: labels(envId, id) },
     spec: { accessModes: ["ReadWriteOnce"], storageClassName: s.storageClass, resources: { requests: { storage: s.workspaceStorage } } },
   };
 }
 
-export type WorkspacePodCtx = { s: KubeSettings; envId: string; id: number; appImage: string; toolchainImage: string; limits: WorkspaceLimits };
+export type WorkspacePodCtx = { s: KubeSettings; envId: string; id: number; appImage: string; toolchainImage: string; limits: WorkspaceLimits; pod?: string; pvc?: string };
 
 export function workspacePodSpec(c: WorkspacePodCtx) {
   const { s } = c;
   return {
     apiVersion: "v1", kind: "Pod",
-    metadata: { name: workspaceName(c.id), namespace: s.namespace, labels: labels(c.envId, c.id) },
+    metadata: { name: c.pod ?? workspaceName(c.id), namespace: s.namespace, labels: labels(c.envId, c.id) },
     spec: {
       restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false,
       activeDeadlineSeconds: Math.max(300, Math.round(c.limits.deadlineSec)), terminationGracePeriodSeconds: 10,
@@ -66,7 +67,7 @@ export function workspacePodSpec(c: WorkspacePodCtx) {
         },
       },
       volumes: [
-        { name: "work", persistentVolumeClaim: { claimName: workspaceName(c.id) } },
+        { name: "work", persistentVolumeClaim: { claimName: c.pvc ?? workspaceName(c.id) } },
         { name: "ws-bin", emptyDir: { sizeLimit: "16Mi" } },
         { name: "tmp", emptyDir: { sizeLimit: s.workspaceEphemeralLimit } },
         { name: "run-user", emptyDir: { medium: "Memory", sizeLimit: "64Mi" } },

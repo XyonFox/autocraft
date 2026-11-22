@@ -441,6 +441,7 @@ export interface DecisionChoices {
   pick: string;
   state: Generated<string>;
   created_at: string;
+  asked_by: string | null;
 }
 
 export interface DecisionClaims {
@@ -802,6 +803,14 @@ export interface FlowSummary {
   decisions_sig: string | null;
 }
 
+export interface GithubApp {
+  id: Generated<number>;
+  app_id: string | null;
+  slug: string | null;
+  keys_enc: string | null;
+  updated_at: string;
+}
+
 export interface GithubAppStates {
   state: string;
   login: string;
@@ -864,6 +873,41 @@ export interface HeldFollowups {
   url: string | null;
   reason: string | null;
   attempts: Generated<number>;
+  updated_at: string;
+}
+
+export interface ImplementationRounds {
+  id: Generated<number>;
+  implementation_id: number;
+  kind: string;
+  call_id: number | null;
+  result: string | null;
+  at: string;
+}
+
+export interface Implementations {
+  id: Generated<number>;
+  repo: string;
+  number: number;
+  queued_by: string;
+  state: string;
+  attempt: number;
+  text_hash: string;
+  base_sha: string | null;
+  workspace_id: number | null;
+  plan_json: string | null;
+  plan_md: string | null;
+  plan_call_id: number | null;
+  session_call_id: number | null;
+  report_json: string | null;
+  diff_hash: string | null;
+  diff_stat: string | null;
+  branch: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  decision_id: string | null;
+  reason: string | null;
+  created_at: string;
   updated_at: string;
 }
 
@@ -1041,6 +1085,15 @@ export interface JobItems {
   outcome: string | null;
   at: string;
   ref: string | null;
+}
+
+export interface JobLogChunks {
+  job_id: number;
+  seq: number;
+  start: number;
+  next_start: number;
+  chunk: string;
+  at: string;
 }
 
 export interface Jobs {
@@ -1623,6 +1676,9 @@ export interface RemoteCalls {
   timeout_ms: number;
   parent_id: number | null;
   sticky_login: string | null;
+  for_login: string | null;
+  own_lane: Generated<number>;
+  bound_slot: Generated<number>;
   released_by: string | null;
   released_at: number | null;
   progress: string | null;
@@ -1642,6 +1698,7 @@ export interface RemoteCalls {
   no_taker_since: number | null;
   bundle_hash: string | null;
   consumed_at: number | null;
+  base_stdin: string | null;
 }
 
 export interface RemoteChecks {
@@ -2125,6 +2182,28 @@ export interface WorkspaceCalls {
   started_at: string | null;
   deadline_at: string | null;
   finished_at: string | null;
+  run_id: number | null;
+}
+
+export interface WorkspaceSessions {
+  id: Generated<number>;
+  kind: string | null;
+  repo: string;
+  base_sha: string;
+  item: number;
+  prompt: string | null;
+  env_id: string;
+  keep: Generated<number>;
+  deadline_sec: number;
+  state: Generated<string>;
+  outcome: string | null;
+  workspace_id: number | null;
+  remote_call_id: number | null;
+  job_id: number | null;
+  requested_by: string;
+  created_at: string;
+  updated_at: string;
+  ended_at: string | null;
 }
 
 export interface Workspaces {
@@ -2151,6 +2230,12 @@ export interface Workspaces {
   created_at: string;
   updated_at: string;
   ended_at: string | null;
+  remote_call_id: number | null;
+  volume_fresh: Generated<number>;
+  resume_tries: Generated<number>;
+  checkpoint_error: string | null;
+  restored: string | null;
+  restored_at: string | null;
 }
 
 export interface DB {
@@ -2221,10 +2306,13 @@ export interface DB {
   fix_attempts: FixAttempts;
   fixups: Fixups;
   flow_summary: FlowSummary;
+  github_app: GithubApp;
   github_app_states: GithubAppStates;
   github_commands: GithubCommands;
   github_setup_links: GithubSetupLinks;
   held_followups: HeldFollowups;
+  implementation_rounds: ImplementationRounds;
+  implementations: Implementations;
   item_activity: ItemActivity;
   item_areas: ItemAreas;
   item_changes: ItemChanges;
@@ -2240,6 +2328,7 @@ export interface DB {
   item_stage: ItemStage;
   items: Items;
   job_items: JobItems;
+  job_log_chunks: JobLogChunks;
   jobs: Jobs;
   lane_next: LaneNext;
   liveness_items: LivenessItems;
@@ -2329,6 +2418,7 @@ export interface DB {
   whitelist_overrides: WhitelistOverrides;
   work_leases: WorkLeases;
   workspace_calls: WorkspaceCalls;
+  workspace_sessions: WorkspaceSessions;
   workspaces: Workspaces;
   "main.access": Access;
   "main.account_usage_samples": AccountUsageSamples;
@@ -2397,10 +2487,13 @@ export interface DB {
   "main.fix_attempts": FixAttempts;
   "main.fixups": Fixups;
   "main.flow_summary": FlowSummary;
+  "main.github_app": GithubApp;
   "main.github_app_states": GithubAppStates;
   "main.github_commands": GithubCommands;
   "main.github_setup_links": GithubSetupLinks;
   "main.held_followups": HeldFollowups;
+  "main.implementation_rounds": ImplementationRounds;
+  "main.implementations": Implementations;
   "main.item_activity": ItemActivity;
   "main.item_areas": ItemAreas;
   "main.item_changes": ItemChanges;
@@ -2416,6 +2509,7 @@ export interface DB {
   "main.item_stage": ItemStage;
   "main.items": Items;
   "main.job_items": JobItems;
+  "main.job_log_chunks": JobLogChunks;
   "main.jobs": Jobs;
   "main.lane_next": LaneNext;
   "main.liveness_items": LivenessItems;
@@ -2505,6 +2599,7 @@ export interface DB {
   "main.whitelist_overrides": WhitelistOverrides;
   "main.work_leases": WorkLeases;
   "main.workspace_calls": WorkspaceCalls;
+  "main.workspace_sessions": WorkspaceSessions;
   "main.workspaces": Workspaces;
 }
 
@@ -2543,7 +2638,7 @@ export const COLUMNS = {
   conversation_includes: ["repo", "number", "source", "by", "at", "sent_turn"],
   conversation_turns: ["id", "repo", "number", "kind", "login", "at", "body", "block", "status", "error", "notes", "seq", "claim", "claimed_at", "progress"],
   conversations: ["repo", "number", "item_block", "item_sig", "created_at", "created_by"],
-  decision_choices: ["id", "decision_id", "repo", "number", "turn_id", "stamp", "seen", "source", "drafts", "added", "pick", "state", "created_at"],
+  decision_choices: ["id", "decision_id", "repo", "number", "turn_id", "stamp", "seen", "source", "drafts", "added", "pick", "state", "created_at", "asked_by"],
   decision_claims: ["decision_id", "login", "since", "at"],
   decision_comments: ["id", "decision_id", "login", "at", "body", "via"],
   decision_items: ["repo", "number", "decision_id"],
@@ -2577,10 +2672,13 @@ export const COLUMNS = {
   fix_attempts: ["repo", "number", "main_sha", "text_hash", "state", "round", "files", "crate", "crate_dir", "patch", "test_patch", "head_task_id", "base_task_id", "retries", "push_tries", "summary", "pr_url", "reason", "created_at", "updated_at", "size", "format_diff"],
   fixups: ["repo", "number", "from_head", "to_head", "state", "reason", "files", "attempt", "created_at", "source", "patch", "lint_task", "lint_round", "lint_state", "carry_decision", "operator_fix", "changes", "session"],
   flow_summary: ["repo", "counts", "counted_at", "stale", "decisions_sig"],
+  github_app: ["id", "app_id", "slug", "keys_enc", "updated_at"],
   github_app_states: ["state", "login", "session_hash", "created_at"],
   github_commands: ["comment_id", "repo", "number", "pr", "command", "weight", "login", "github_id", "created_at", "requested_at", "state", "result", "done_at", "tried_at", "retries", "allowed", "reply", "ref_repo", "ref_number", "ref_branch"],
   github_setup_links: ["id", "org", "created_by", "hash", "created_at", "expires_at", "revoked_at", "used_at", "used_by", "installation_id"],
   held_followups: ["id", "card_id", "choice_id", "decision_id", "answer_seq", "preapproval_id", "repo", "number", "issue_repo", "title", "body", "by", "at", "state", "issue_number", "url", "reason", "attempts", "updated_at"],
+  implementation_rounds: ["id", "implementation_id", "kind", "call_id", "result", "at"],
+  implementations: ["id", "repo", "number", "queued_by", "state", "attempt", "text_hash", "base_sha", "workspace_id", "plan_json", "plan_md", "plan_call_id", "session_call_id", "report_json", "diff_hash", "diff_stat", "branch", "pr_number", "pr_url", "decision_id", "reason", "created_at", "updated_at"],
   item_activity: ["repo", "number", "id", "kind", "at", "actor", "label", "before_oid", "after_oid"],
   item_areas: ["repo", "number", "area", "source", "confidence", "list_version", "at"],
   item_changes: ["seq", "repo", "number"],
@@ -2596,6 +2694,7 @@ export const COLUMNS = {
   item_stage: ["repo", "number", "stage", "at", "reviewed"],
   items: ["repo", "number", "kind", "state", "title", "body", "url", "author", "author_type", "author_association", "created_at", "updated_at", "closed_at", "merged_at", "merged_by", "state_reason", "is_draft", "labels", "assignees", "comments_count", "reactions_count", "additions", "deletions", "changed_files", "head_ref", "head_oid", "head_repo", "base_ref", "maintainer_can_modify", "mergeable", "review_decision", "ci_state", "closing_issues", "detail_level", "embed_hash", "class_hash", "class_scheme", "text_refs", "author_id"],
   job_items: ["id", "job_id", "repo", "number", "outcome", "at", "ref"],
+  job_log_chunks: ["job_id", "seq", "start", "next_start", "chunk", "at"],
   jobs: ["id", "step", "params", "requested_by", "requested_at", "state", "started_at", "ended_at", "progress", "summary", "error", "usage", "log_path", "pid", "cancel_requested_at", "cancel_requested_by", "repo", "items", "acted", "resumes", "lease_skips", "lease_skip_keys"],
   lane_next: ["lane", "total", "items", "at"],
   liveness_items: ["repo", "number", "kind", "verdict", "cause", "state", "wait", "phase", "since", "checked_at"],
@@ -2640,7 +2739,7 @@ export const COLUMNS = {
   push_outcomes: ["id", "at", "stage", "action", "repo", "number", "from_oid", "to_oid", "before_res", "after_res", "outcome", "resolved_at"],
   release_apps: ["repo", "name", "stars", "updated_at"],
   release_assets: ["asset_id", "repo", "release_id", "tag", "release_name", "published_at", "prerelease", "name", "platform", "processor", "format", "downloads", "first_seen", "updated_at", "gone_at"],
-  remote_calls: ["id", "job_id", "step", "stage", "run_id", "prompt_id", "prompt_version", "tier", "effort", "asked_model", "bundle", "state", "items", "repo", "class", "level", "since", "seen_at", "queued_since", "queued_ms", "user_login", "harness", "harness_version", "model", "lease_secret_hash", "token_id", "leased_at", "heartbeat_at", "started_at", "claim_id", "attempt", "max_attempts", "timeout_ms", "parent_id", "sticky_login", "released_by", "released_at", "progress", "reply", "usage", "turns", "session_id", "duration_ms", "error", "ended_at", "reference_repo", "root", "authors", "picked_by", "picked_at", "pick_until", "no_taker_since", "bundle_hash", "consumed_at"],
+  remote_calls: ["id", "job_id", "step", "stage", "run_id", "prompt_id", "prompt_version", "tier", "effort", "asked_model", "bundle", "state", "items", "repo", "class", "level", "since", "seen_at", "queued_since", "queued_ms", "user_login", "harness", "harness_version", "model", "lease_secret_hash", "token_id", "leased_at", "heartbeat_at", "started_at", "claim_id", "attempt", "max_attempts", "timeout_ms", "parent_id", "sticky_login", "for_login", "own_lane", "bound_slot", "released_by", "released_at", "progress", "reply", "usage", "turns", "session_id", "duration_ms", "error", "ended_at", "reference_repo", "root", "authors", "picked_by", "picked_at", "pick_until", "no_taker_since", "bundle_hash", "consumed_at", "base_stdin"],
   remote_checks: ["id", "call_id", "run_id", "input", "state", "result", "requested_at", "ended_at"],
   remote_cooloffs: ["login", "until", "reason", "failures", "failures_since"],
   remote_helpers: ["token_id", "login", "readiness", "until", "reason", "harness", "models", "reserve", "usage", "reported_at", "slots", "busy", "last_error", "helper_version"],
@@ -2684,6 +2783,7 @@ export const COLUMNS = {
   verifications: ["repo", "number", "head_sha", "base_sha", "kind", "reason", "plan", "model", "head_task_id", "base_task_id", "state", "summary", "note", "created_at", "finished_at"],
   whitelist_overrides: ["login", "status", "note", "by", "at", "github_id"],
   work_leases: ["key", "job_id", "step", "taken_at"],
-  workspace_calls: ["id", "workspace_id", "n", "tool", "args", "state", "result", "created_at", "started_at", "deadline_at", "finished_at"],
-  workspaces: ["id", "repo", "base_sha", "base_commit", "app", "env_id", "state", "state_at", "pod", "pod_created_at", "create_tries", "pvc", "node", "limits", "checkpoint", "checkpoint_at", "last_call_at", "next_call", "error", "owner", "created_at", "updated_at", "ended_at"],
+  workspace_calls: ["id", "workspace_id", "n", "tool", "args", "state", "result", "created_at", "started_at", "deadline_at", "finished_at", "run_id"],
+  workspace_sessions: ["id", "kind", "repo", "base_sha", "item", "prompt", "env_id", "keep", "deadline_sec", "state", "outcome", "workspace_id", "remote_call_id", "job_id", "requested_by", "created_at", "updated_at", "ended_at"],
+  workspaces: ["id", "repo", "base_sha", "base_commit", "app", "env_id", "state", "state_at", "pod", "pod_created_at", "create_tries", "pvc", "node", "limits", "checkpoint", "checkpoint_at", "last_call_at", "next_call", "error", "owner", "created_at", "updated_at", "ended_at", "remote_call_id", "volume_fresh", "resume_tries", "checkpoint_error", "restored", "restored_at"],
 } as const;

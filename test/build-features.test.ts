@@ -42,3 +42,13 @@ test("a switch change is not planner input", async () => {
   assert.equal(after["build-features"], (before["build-features"] ?? 0) + 1);
   assert.equal(after.settings, before.settings);
 });
+
+test("the Implement switch is planner input", async () => {
+  const db = await fresh();
+  const before = await readSeqs(db);
+  await setFeature(db, "implement", true, "op", "app");
+  const after = await readSeqs(db);
+  const woke = INPUT_TOPICS.filter((t) => after[t] !== before[t]);
+  assert.ok(woke.length > 0, "no planner input topic moved");
+  assert.equal(after.settings, before.settings, "the settings topic keeps its own trigger");
+});

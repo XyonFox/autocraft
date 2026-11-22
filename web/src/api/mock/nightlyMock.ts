@@ -2,6 +2,7 @@
 import type { Api } from "../client";
 import type { NightlyCell, NightlyGrid, NightlyRepo, NightlySeries, NightlyState, User } from "../types";
 import { NOW } from "./fixtures";
+import { mayRunMock } from "./adminMock";
 
 const wait = <T>(v: T, ms = 60) => new Promise<T>((r) => setTimeout(() => r(structuredClone(v)), ms));
 const DAY = 86_400_000;
@@ -13,12 +14,12 @@ const steady = (state: NightlyState, base: number, mixed: Record<number, Nightly
 
 const series = (n: number, f: (i: number) => number) => Array.from({ length: n }, (_, i) => f(i));
 
-function build(): NightlyRepo[] {
+function build(me: User): NightlyRepo[] {
   const nights = (repo: string) => Array.from({ length: NIGHTS }, (_, i) => ({ runId: 900 - i, startedAt: new Date(NOW - (i * DAY + 5 * 3_600_000)).toISOString(), sha: `${repo.charCodeAt(0)}e1c${(97 - i).toString(16)}0b44aa21` }));
   const base = { experimental: false, needs: null, crates: [] as string[], targets: [] as string[] };
   return [
     {
-      repo: "bundle-rs", on: true, nights: nights("b"), benches: [
+      repo: "bundle-rs",  canSelect: mayRunMock(me, "bundle-rs"), on: true, nights: nights("b"), benches: [
         { name: "parse::small", unit: "ns/iter", latest: 1180, deltaPct: 14.4, at: new Date(NOW - 5 * 3_600_000).toISOString(), points: series(30, (i) => 1000 + (i % 4) * 12 + (i > 26 ? (i - 26) * 45 : 0)) },
         { name: "parse::large", unit: "ns/iter", latest: 48200, deltaPct: -1.2, at: new Date(NOW - 5 * 3_600_000).toISOString(), points: series(30, (i) => 48000 + ((i * 37) % 9) * 120) },
         { name: "encode::roundtrip", unit: "ns/iter", latest: 9300, deltaPct: 0.4, at: new Date(NOW - 5 * 3_600_000).toISOString(), points: series(30, (i) => 9250 + ((i * 11) % 5) * 15) },
@@ -34,7 +35,7 @@ function build(): NightlyRepo[] {
       ],
     },
     {
-      repo: "pdfcraft", on: true, nights: nights("p").slice(0, 9), benches: [],
+      repo: "pdfcraft",  canSelect: mayRunMock(me, "pdfcraft"), on: true, nights: nights("p").slice(0, 9), benches: [],
       checks: [
         { ...base, id: "audit", label: "Dependency audit", enabled: true, takes: null, cells: steady("pass", 6000).slice(0, 9) },
         { ...base, id: "wasm", label: "WebAssembly build", enabled: false, takes: "crates", cells: Array(9).fill(null) },
@@ -46,7 +47,7 @@ function build(): NightlyRepo[] {
       ],
     },
     {
-      repo: "photocraft", on: false, nights: [], benches: [],
+      repo: "photocraft",  canSelect: mayRunMock(me, "photocraft"), on: false, nights: [], benches: [],
       checks: ["audit", "wasm", "windows", "miri", "bench", "fuzz", "asan"].map((id) => ({
         ...base, id, label: id, enabled: false, takes: id === "audit" ? null : id === "fuzz" ? "targets" : "crates", cells: [],
       })),
@@ -55,7 +56,7 @@ function build(): NightlyRepo[] {
 }
 
 export function createNightlyMock(me: User, changed: () => void): Pick<Api, "nightly"> {
-  const repos = build();
+  const repos = build(me);
   const grid = (): NightlyGrid => ({ repos });
   return {
     nightly: {
@@ -66,7 +67,7 @@ export function createNightlyMock(me: User, changed: () => void): Pick<Api, "nig
         return wait({ repo, bench, unit: b.unit, points: b.points.map((value, i) => ({ sha: `sha${i}`, at: new Date(NOW - (b.points.length - i) * DAY).toISOString(), value })) });
       },
       async select(input) {
-        if (me.role !== "operator") throw new Error("operators only");
+        if (!mayRunMock(me, input.repo)) throw new Error("only an operator, or a maintainer with write access to the repo, selects its nightly checks");
         const c = repos.find((r) => r.repo === input.repo)?.checks.find((x) => x.id === input.check);
         if (!c) throw new Error("unknown check");
         c.enabled = input.enabled;

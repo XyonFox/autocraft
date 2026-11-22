@@ -130,7 +130,7 @@ export async function ghToken(owner?: string): Promise<string | null> {
   try { env = await readEnv(owner); } catch (e) { console.log(`image proxy token: ${String((e as Error).message ?? e)}`); return null; }
   if (env) return env.GH_TOKEN ?? null;
   return new Promise((resolve) => {
-    execFile("gh", ["auth", "token"], { cwd: REPO_DIR, timeout: 15_000, encoding: "utf8" }, (err, stdout) => {
+    execFile("gh", ["auth", "token"], { cwd: REPO_DIR, timeout: 15_000, encoding: "utf8", windowsHide: true }, (err, stdout) => {
       const t = String(stdout ?? "").trim();
       resolve(err || !/^[\w-]+$/.test(t) ? null : t);
     });

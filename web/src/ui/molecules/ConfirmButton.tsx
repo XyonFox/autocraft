@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { Button } from "../atoms/Button";
 import { cn } from "../cn";
 
-/** A destructive action that takes a second click within four seconds. */
-export function ConfirmButton({ label, confirmLabel, loading, onConfirm, className, idle = "ghost" }: { label: string; confirmLabel: string; loading?: boolean; onConfirm: () => void; className?: string; idle?: "ghost" | "secondary" }) {
+/** A destructive action that takes a second click within four seconds. `target` names what it acts on, after the visible label in the accessible name, where several such buttons share a list. */
+export function ConfirmButton({ label, confirmLabel, loading, onConfirm, className, idle = "ghost", target }: { label: string; confirmLabel: string; loading?: boolean; onConfirm: () => void; className?: string; idle?: "ghost" | "secondary"; target?: string }) {
   const [armed, setArmed] = useState(false);
   useEffect(() => {
     if (!armed) return;
@@ -16,6 +16,7 @@ export function ConfirmButton({ label, confirmLabel, loading, onConfirm, classNa
       variant={armed ? "destructive" : idle}
       loading={loading}
       className={cn("max-md:h-11", className)}
+      aria-label={target ? `${armed ? confirmLabel : label} ${target}` : undefined}
       onClick={() => {
         if (!armed) return setArmed(true);
         setArmed(false);

@@ -1,6 +1,7 @@
 // Opens database handles. The only module that loads the kysely and pg packages, with dynamic imports: the build worker
 // runs src/ without node_modules and never opens the app database (test/no-package-imports.test.ts).
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { connect, dbPath } from "../db.ts";
@@ -94,6 +95,8 @@ export interface ConnectOptions {
   role?: DbRole;
   /** Postgres: bring the schema and triggers up to date first (default). False opens the database as it is. */
   migrate?: boolean;
+  /** Postgres: how long a transaction may sit idle before the server ends its session (default 60 s). */
+  idleInTransactionMs?: number;
 }
 
 /**
@@ -104,7 +107,7 @@ export async function connectDb(target: string = dbTarget(), opts: ConnectOption
   if (testRedirect && !isPgUrl(target)) target = await testRedirect(target);
   if (!isPgUrl(target)) return dbFor(connect(target, opts));
   const [k, pg] = await Promise.all([loadKysely(), loadPg()]);
-  const db = new Handle((ctx) => postgresEngine(k, pg, target, { role: opts.role ?? role, busyTimeoutMs: opts.busyTimeoutMs }, ctx));
+  const db = new Handle((ctx) => postgresEngine(k, pg, target, { role: opts.role ?? role, busyTimeoutMs: opts.busyTimeoutMs, idleInTransactionMs: opts.idleInTransactionMs }, ctx));
   if (opts.migrate === false) return db;
   try {
     // A current database costs two reads on the pool; only a stale one opens a connection of its own for the migration.
@@ -132,9 +135,17 @@ let proc: Promise<{ db: Db; close: () => Promise<void> }> | undefined;
  * `closeDb()` closes it.
  */
 export async function openDb(): Promise<Db> {
-  proc ??= connectDb().then((db) => {
+  proc ??= connectDb().then(async (db) => {
     const close = db.close.bind(db);
     db.close = async () => {};
+    // The GitHub App's keys of this process (job processes, commands, the runner) come from this database.
+    await (await import("../github/app-keys.ts")).openAppKeys(db).catch(async (e: Error) => {
+      // A process without the file never reads the keys by design (a build worker); say so only when a stored app is going unread.
+      const file = envVar("SECRETS_FILE");
+      if (!file || !existsSync(file)) return;
+      const stored = await db.get(db.k.selectFrom("github_app").select("id").where("id", "=", 1).where("keys_enc", "is not", null)).catch(() => undefined);
+      if (stored) console.error(`GitHub App keys not read: ${e.message}`);
+    });
     return { db, close };
   });
   return (await proc).db;

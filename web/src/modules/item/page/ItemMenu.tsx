@@ -8,6 +8,7 @@ import { useWrite } from "../../../lib/hooks";
 import { ErrorLine } from "../../admin/parts";
 import { refOf, useFastTrack, useHeldMerges } from "../../queue/fastTrack";
 import { useUser } from "../../../shell/UserContext";
+import { canRun } from "../../../registry/permissions";
 
 const RELEASES: { key: keyof ItemReleases; action: ReleaseAction; label: string; confirm: string }[] = [
   { key: "reviewAgain", action: "review-again", label: "Review again at this head", confirm: "Delete the hold, review again" },
@@ -51,7 +52,7 @@ export function ItemMenu({ d }: { d: ItemPageData }) {
   const write = useWrite();
   const fast = useFastTrack();
   const held = useHeldMerges();
-  const operator = useUser().role === "operator";
+  const operator = canRun(useUser(), d.repo);
   const open = d.state === "open";
   const ref = refOf(d.repo, d.number);
   const fastOn = fast.includes(ref);

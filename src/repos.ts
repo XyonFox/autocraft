@@ -49,7 +49,7 @@ export type RepoExists = (owner: string, name: string) => Promise<boolean>;
 export const ghRepoExists: RepoExists = async (owner, name) => {
   let env: Awaited<ReturnType<typeof readEnv>>;
   try { env = await readEnv(owner); } catch (e) { if (e instanceof AppReadError && e.notInstalled) return false; throw e; }
-  return new Promise((resolve) => execFile("gh", ["api", `repos/${owner}/${name}`, "--jq", ".full_name"], { timeout: 30_000, ...(env ? { env } : {}) }, (err) => resolve(!err)));
+  return new Promise((resolve) => execFile("gh", ["api", `repos/${owner}/${name}`, "--jq", ".full_name"], { timeout: 30_000, windowsHide: true, ...(env ? { env } : {}) }, (err) => resolve(!err)));
 };
 
 /**
@@ -184,7 +184,7 @@ export const commands = {
       if (args[0] === undefined) { console.log(await githubIdentity(db)); return; }
       try {
         let registered = false;
-        try { registered = readAppSecrets() !== null; } catch { /* unreadable file: no app */ }
+        registered = readAppSecrets() !== null;
         const changed = await setGithubIdentityChecked(db, "cli", args[0], { registered: () => registered });
         console.log(changed ? `identity ${args[0]} (dashboard sessions end; everyone signs in again)` : `identity was already ${args[0]}`);
       } catch (e) {

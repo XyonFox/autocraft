@@ -105,16 +105,24 @@ export function parseChecks(repo: string, repository: Record<string, PrNode | nu
   return out;
 }
 
+/**
+ * Stores checks rows and what follows from them (approvable runs, push outcomes, unknown merge states). Each part reads its
+ * rows in one query per batch and writes in multi-row statements: on Postgres every statement is a network round trip.
+ */
 export async function saveChecks(db: Db, rows: PrChecks[], at = new Date().toISOString()): Promise<void> {
-  for (const r of rows)
-    await db.run(db.k.insertInto("pr_checks").values({
-      repo: r.repo, number: r.number, head_oid: r.head_oid, state: r.state, is_draft: r.is_draft ? 1 : 0, overall: r.overall, checks: JSON.stringify(r.checks),
-      mergeable: r.mergeable, maintainer_can_modify: r.maintainer_can_modify ? 1 : 0, fetched_at: at,
-    }).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
-      ...kx.excluded(["head_oid", "state", "is_draft", "overall", "checks", "maintainer_can_modify", "fetched_at"])(eb),
-      mergeable: keepKnownMergeableExpr(eb, "pr_checks"),
-    }))));
-  for (const r of rows) await recordRuns(db, r, at);
+  // A PR read twice keeps its last reading: a multi-row upsert cannot touch one row twice.
+  rows = [...new Map(rows.map((r) => [`${r.repo}#${r.number}`, r])).values()];
+  if (rows.length) await db.write(async () => {
+    for (const part of kx.batches(rows))
+      await db.run(db.k.insertInto("pr_checks").values(part.map((r) => ({
+        repo: r.repo, number: r.number, head_oid: r.head_oid, state: r.state, is_draft: r.is_draft ? 1 : 0, overall: r.overall, checks: JSON.stringify(r.checks),
+        mergeable: r.mergeable, maintainer_can_modify: r.maintainer_can_modify ? 1 : 0, fetched_at: at,
+      }))).onConflict((oc) => oc.columns(["repo", "number"]).doUpdateSet((eb) => ({
+        ...kx.excluded(["head_oid", "state", "is_draft", "overall", "checks", "maintainer_can_modify", "fetched_at"])(eb),
+        mergeable: keepKnownMergeableExpr(eb, "pr_checks"),
+      }))));
+  });
+  await recordRuns(db, rows, at);
   await resolvePushes(db, rows, at);
   await noteMergeable(db, rows, at);
 }
@@ -124,13 +132,24 @@ export async function refreshChecks(db: Db, client: Querier, repo: string, numbe
   const list = numbers ?? (await db.all(db.k.selectFrom("items as i").select("i.number").where("i.repo", "=", repo).where("i.kind", "=", "pr").where("i.state", "=", "OPEN")
     .where((eb) => pilotExpr(db, eb, "i")).orderBy("i.number"))).map((r) => r.number);
   const all: PrChecks[] = [];
+  // Rows are stored once BATCH_ROWS are read (and at the end), so the statements per PR stay a fraction of one.
+  let unsaved: PrChecks[] = [];
   for (let i = 0; i < list.length; i += CHECKS_PER_QUERY) {
     const chunk = list.slice(i, i + CHECKS_PER_QUERY);
-    const data = await client.query(checksQuery(chunk), { owner: ownerOf(repo), name: repo });
-    const rows = parseChecks(repo, (data as { repository: Record<string, PrNode | null> }).repository);
-    await saveChecks(db, rows);
+    let rows: PrChecks[];
+    try {
+      const data = await client.query(checksQuery(chunk), { owner: ownerOf(repo), name: repo });
+      rows = parseChecks(repo, (data as { repository: Record<string, PrNode | null> }).repository);
+    } catch (e) {
+      // The rows read before a failed query are stored: a chunk that keeps failing loses only its own rows and the ones after it.
+      if (unsaved.length) await saveChecks(db, unsaved).catch((s: unknown) => log(`checks: ${repo}: storing the rows read before the failed query failed: ${String((s as Error).message ?? s)}`));
+      throw e;
+    }
+    unsaved.push(...rows);
     all.push(...rows);
+    if (unsaved.length >= kx.BATCH_ROWS) { await saveChecks(db, unsaved); unsaved = []; }
   }
+  if (unsaved.length) await saveChecks(db, unsaved);
   log(`checks: ${repo}: ${all.length} PRs (${(["success", "failure", "pending", "none"] as const).map((o) => `${all.filter((r) => r.overall === o).length} ${o}`).join(", ")})`);
   return all;
 }

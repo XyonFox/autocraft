@@ -3,6 +3,7 @@
 // header and the per-session limits; these handlers check roles and GitHub
 // permissions themselves. Item and comment text is returned as data only.
 import { live } from "./live.ts";
+import { mayRunRepo } from "../repo-access.ts";
 import { isHiddenRepo, type HiddenRepos } from "../../hidden-sql.ts";
 import * as kx from "../../db/kx.ts";
 import { prBuildView } from "../../prbuild/view.ts";
@@ -17,7 +18,7 @@ import { excludeHiddenExpr, hiddenRepos, allVisibleRepos, needVisible, repoOwner
 import { withoutHiddenExpr } from "./decisions.ts";
 import { contributors } from "../../whitelist.ts";
 import { doneByRepo, funnelByRepo, latestCteExpr, trackedExpr, trackingStart, trend, type DoneRow, type FunnelRow } from "./stats.ts";
-import { HttpError, RateLimiter } from "../server/util.ts";
+import { HttpError, RateLimiter, share } from "../server/util.ts";
 import { findingsOf, type PremergeRow } from "../../premerge/store.ts";
 import type { Req, Res, Route } from "../types.ts";
 import * as adm from "./admin.ts";
@@ -103,12 +104,20 @@ async function writeRepos(db: Db, req: Req): Promise<string[]> {
   return repos.filter((_, i) => ok[i]);
 }
 
+/** The visible repos this user runs (src/dash/repo-access.ts): the web reads it instead of the role for per-repo and per-item actions. */
+async function runRepos(db: Db, req: Req): Promise<string[]> {
+  const repos = await allVisibleRepos(db, req);
+  const ok = await Promise.all(repos.map((r) => mayRunRepo(req.user, r)));
+  return repos.filter((_, i) => ok[i]);
+}
+
 async function me(db: Db, req: Req): Promise<User> {
   const mw = await db.get(db.k.selectFrom("settings").select("value").where("key", "=", "maintainer_writes"));
   return {
     login: req.user.login,
     role: req.user.role,
     writeRepos: await writeRepos(db, req),
+    runRepos: await runRepos(db, req),
     maintainerWrites: mw?.value === "1",
     maintainerSettles: await maintainersSettle(db),
     inference: await inferenceMode(db),
@@ -422,7 +431,7 @@ async function progress(db: Db, hidden: HiddenRepos): Promise<Progress> {
 // ---- routes --------------------------------------------------------------
 
 export function apiRoutes(opts: ApiOptions = {}): Route[] {
-  const limiter = opts.limiter ?? new RateLimiter(opts.writesPerHour ?? 60, 3600_000);
+  const limiter = opts.limiter ?? new RateLimiter(share(opts.writesPerHour ?? 60), 3600_000);
   const vectors = new VectorIndex(opts.embedder ?? localEmbedder({ threads: 2 }));
   const get = (pattern: string, fn: (db: Db, req: Req) => Promise<unknown>): Route => ({ method: "GET", pattern, handler: ok(fn) });
   const post = (pattern: string, fn: (db: Db, req: Req) => Promise<unknown>): Route => ({ method: "POST", pattern, handler: ok(fn) });
@@ -442,11 +451,11 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     post("/api/decisions/:id/retry", dec.retry),
     post("/api/decisions/:id/dispute", dec.dispute),
     post("/api/decisions/:id/keep", dec.keepAnswer),
-    { method: "POST", pattern: "/api/decisions/:id/snooze", operator: true, handler: ok(dec.snooze) },
-    { method: "POST", pattern: "/api/decisions/:id/reprepare", operator: true, handler: ok(dec.reprepare) },
+    { method: "POST", pattern: "/api/decisions/:id/snooze", handler: ok(dec.snooze) },
+    { method: "POST", pattern: "/api/decisions/:id/reprepare", handler: ok(dec.reprepare) },
     post("/api/decisions/:id/reopen", dec.reopen),
     post("/api/items/:repo/:n/backlog", dec.backlogItemRoute),
-    { method: "POST", pattern: "/api/decisions/backlog", operator: true, handler: ok(dec.backlogBulk) },
+    { method: "POST", pattern: "/api/decisions/backlog", handler: ok(dec.backlogBulk) },
     post("/api/decisions/:id/adopt", dec.adopt),
     post("/api/decisions/:id/feedback", async (db, req) => dec.feedback(db, req, limiter)),
     post("/api/decisions/:id/retract", async (db, req) => dec.retract(db, req, limiter)),
@@ -474,26 +483,27 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/items/:repo/:n/trace/event", itemTraceDetail),
     get("/api/items/:repo/:n/decision", dec.forItem),
     get("/api/conversations/:repo/:n", conv.getConversation),
-    { method: "POST", pattern: "/api/conversations/:repo/:n/messages", operator: true, handler: ok(async (db, req) => conv.postMessage(db, req)) },
-    { method: "POST", pattern: "/api/conversations/:repo/:n/includes", operator: true, handler: ok(async (db, req) => conv.postInclude(db, req)) },
+    { method: "POST", pattern: "/api/conversations/:repo/:n/messages", handler: ok(async (db, req) => conv.postMessage(db, req)) },
+    { method: "POST", pattern: "/api/conversations/:repo/:n/withdraw", handler: ok(async (db, req) => conv.postWithdraw(db, req)) },
+    { method: "POST", pattern: "/api/conversations/:repo/:n/includes", handler: ok(async (db, req) => conv.postInclude(db, req)) },
     { method: "POST", pattern: "/api/conversation-cards/:id/edit", handler: ok(conv.editCardText) },
     { method: "POST", pattern: "/api/conversation-cards/:id/do", handler: ok(async (db, req) => conv.doIt(db, req)) },
     { method: "POST", pattern: "/api/conversation-cards/:id/dismiss", handler: ok(conv.dismiss) },
     { method: "POST", pattern: "/api/conversation-cards/:id/dispute", handler: ok(conv.disputePress) },
     { method: "POST", pattern: "/api/conversation-cards/:id/keep", handler: ok(conv.keepPress) },
     { method: "POST", pattern: "/api/decision-choices/:id/do", handler: ok(async (db, req) => conv.doChoice(db, req)) },
-    { method: "POST", pattern: "/api/items/:repo/:n/preapproval/cancel", operator: true, handler: ok(operator.cancelItemPreapproval) },
-    { method: "POST", pattern: "/api/items/:repo/:n/preapproval/retry", operator: true, handler: ok(operator.retryItemPreapproval) },
-    { method: "POST", pattern: "/api/items/:repo/:n/review-again", operator: true, handler: ok(operator.reviewItemAgain) },
-    { method: "POST", pattern: "/api/items/:repo/:n/verify-again", operator: true, handler: ok(operator.verifyItemAgain) },
-    { method: "POST", pattern: "/api/items/:repo/:n/stop-fix", operator: true, handler: ok(operator.stopFixItem) },
-    { method: "POST", pattern: "/api/items/:repo/:n/fix-again", operator: true, handler: ok(operator.fixItemAgain) },
+    { method: "POST", pattern: "/api/items/:repo/:n/preapproval/cancel", handler: ok(operator.cancelItemPreapproval) },
+    { method: "POST", pattern: "/api/items/:repo/:n/preapproval/retry", handler: ok(operator.retryItemPreapproval) },
+    { method: "POST", pattern: "/api/items/:repo/:n/review-again", handler: ok(operator.reviewItemAgain) },
+    { method: "POST", pattern: "/api/items/:repo/:n/verify-again", handler: ok(operator.verifyItemAgain) },
+    { method: "POST", pattern: "/api/items/:repo/:n/stop-fix", handler: ok(operator.stopFixItem) },
+    { method: "POST", pattern: "/api/items/:repo/:n/fix-again", handler: ok(operator.fixItemAgain) },
     get("/api/areas/:repo", areas.repoAreas),
-    { method: "POST", pattern: "/api/areas/:repo/edit", operator: true, handler: ok(areas.edit) },
-    { method: "POST", pattern: "/api/areas/:repo/run", operator: true, handler: ok(areas.run) },
-    { method: "POST", pattern: "/api/area-proposals/:id/accept", operator: true, handler: ok(areas.acceptProposalApi) },
-    { method: "POST", pattern: "/api/area-proposals/:id/dismiss", operator: true, handler: ok(areas.dismiss) },
-    { method: "POST", pattern: "/api/items/:repo/:n/batch-again", operator: true, handler: ok(operator.batchItemAgain) },
+    { method: "POST", pattern: "/api/areas/:repo/edit", handler: ok(areas.edit) },
+    { method: "POST", pattern: "/api/areas/:repo/run", handler: ok(areas.run) },
+    { method: "POST", pattern: "/api/area-proposals/:id/accept", handler: ok(areas.acceptProposalApi) },
+    { method: "POST", pattern: "/api/area-proposals/:id/dismiss", handler: ok(areas.dismiss) },
+    { method: "POST", pattern: "/api/items/:repo/:n/batch-again", handler: ok(operator.batchItemAgain) },
     scoped(get("/api/items", items.listItems)),
     heavy(get("/api/search", async (db, req) => req.query.get("mode") === "semantic" ? sim.semanticSearch(db, req, vectors) : items.quickSearch(db, req)), (q) => q.get("mode") === "semantic"),
     get("/api/progress", async (db, req) => await progress(db, await hiddenRepos(db, req))),
@@ -537,8 +547,6 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     post("/api/repos/push-revoke", async (db, req) => await adm.pushApproval(db, req, false)),
     post("/api/repos/fixissue-approve", async (db, req) => await adm.fixIssueApproval(db, req, true)),
     post("/api/repos/fixissue-revoke", async (db, req) => await adm.fixIssueApproval(db, req, false)),
-    post("/api/repos/ci-approve", async (db, req) => await adm.ciApproval(db, req, true)),
-    post("/api/repos/ci-revoke", async (db, req) => await adm.ciApproval(db, req, false)),
     post("/api/repos/mainfix-approve", async (db, req) => await adm.mainFixApproval(db, req, true)),
     post("/api/repos/mainfix-revoke", async (db, req) => await adm.mainFixApproval(db, req, false)),
     post("/api/repos/optional-check-add", async (db, req) => await adm.optionalCheck(db, req, true)),
@@ -559,7 +567,7 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/pipeline/jobs", pipeline.jobs),
     get("/api/pipeline/jobs/:id", pipeline.job),
     { method: "POST", pattern: "/api/pipeline/jobs", operator: true, handler: ok(pipeline.request) },
-    { method: "POST", pattern: "/api/pipeline/jobs/:id/cancel", operator: true, handler: ok(pipeline.cancel) },
+    { method: "POST", pattern: "/api/pipeline/jobs/:id/cancel", handler: ok(pipeline.cancel) },
     get("/api/pipeline/state", pipeline.state),
     { method: "PUT", pattern: "/api/pipeline/state", operator: true, handler: ok(pipeline.putState) },
     { method: "GET", pattern: "/api/pipeline/judgement-model", operator: true, handler: ok(async (db) => await pipeline.getJudgementModel(db)) },
@@ -567,11 +575,11 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "PUT", pattern: "/api/pipeline/limits/:step", operator: true, handler: ok(pipeline.putLimit) },
     { method: "POST", pattern: "/api/pipeline/limits/:step/reset", operator: true, handler: ok(pipeline.resetLimit) },
     { method: "POST", pattern: "/api/pipeline/steps/:step/deadline-ack", operator: true, handler: ok(pipeline.ackStepDeadline) },
-    { method: "POST", pattern: "/api/pipeline/trips/:stage/resume", operator: true, handler: ok(pipeline.resumeTrip) },
+    { method: "POST", pattern: "/api/pipeline/trips/:stage/resume", handler: ok(pipeline.resumeTrip) },
     { method: "PUT", pattern: "/api/pipeline/pilot", operator: true, handler: ok(adm.putPilot) },
     { method: "PUT", pattern: "/api/pipeline/outside-limits", operator: true, handler: ok(outside.putLimits) },
     { method: "POST", pattern: "/api/pipeline/outside/release", operator: true, handler: ok(outside.releaseAll) },
-    { method: "POST", pattern: "/api/items/:repo/:n/release-outside", operator: true, handler: ok(outside.release) },
+    { method: "POST", pattern: "/api/items/:repo/:n/release-outside", handler: ok(outside.release) },
     scoped(get("/api/needs/outside/:author", outside.held)),
     get("/api/prompts", prompts),
     get("/api/accounts", agents.accounts),
@@ -599,17 +607,17 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     { method: "POST", pattern: "/api/envs/:id/rotate-key", operator: true, handler: ok(build.postRotate) },
     get("/api/tasks", build.tasks),
     get("/api/tasks/:id", build.task),
-    { method: "POST", pattern: "/api/tasks/:id/cancel", operator: true, handler: ok(build.cancel) },
+    { method: "POST", pattern: "/api/tasks/:id/cancel", handler: ok(build.cancel) },
     { method: "GET", pattern: "/api/tasks/:id/artifacts/:name", handler: build.artifact },
     get("/api/nightly", nightly.grid),
     get("/api/nightly/bench/:repo/:bench", nightly.series),
-    { method: "POST", pattern: "/api/nightly/select", operator: true, handler: ok(nightly.select) },
+    { method: "POST", pattern: "/api/nightly/select", handler: ok(nightly.select) },
     get("/api/build/summary", build.buildSummary),
     get("/api/build/features", build.features),
     { method: "POST", pattern: "/api/build/features", operator: true, handler: ok(build.postFeature) },
     get("/api/build/screenshots", build.screenshots),
-    { method: "PUT", pattern: "/api/build/screenshots/:repo", operator: true, handler: ok(build.putScreenshots) },
-    { method: "DELETE", pattern: "/api/build/screenshots/:repo", operator: true, handler: ok(build.deleteScreenshots) },
+    { method: "PUT", pattern: "/api/build/screenshots/:repo", handler: ok(build.putScreenshots) },
+    { method: "DELETE", pattern: "/api/build/screenshots/:repo", handler: ok(build.deleteScreenshots) },
     scoped(get("/api/next", next)),
     scoped(heavy(get("/api/queue", queue))),
     scoped(heavy(get("/api/queue/batches", queueBatches))),
@@ -619,14 +627,14 @@ export function apiRoutes(opts: ApiOptions = {}): Route[] {
     get("/api/repos/pipeline", pipelineRepoNames),
     get("/api/fast-track", fastTrackRefs),
     get("/api/merge/held", heldMergeRefs),
-    { method: "POST", pattern: "/api/fast-track", operator: true, handler: ok(fastTrackAdd) },
-    { method: "POST", pattern: "/api/fast-track/remove", operator: true, handler: ok(fastTrackRemove) },
-    { method: "POST", pattern: "/api/fast-track/weight", operator: true, handler: ok(fastTrackWeight) },
+    { method: "POST", pattern: "/api/fast-track", handler: ok(fastTrackAdd) },
+    { method: "POST", pattern: "/api/fast-track/remove", handler: ok(fastTrackRemove) },
+    { method: "POST", pattern: "/api/fast-track/weight", handler: ok(fastTrackWeight) },
     post("/api/queue/add", queueAdd),
-    { method: "POST", pattern: "/api/merge/hold", operator: true, handler: ok(async (db, req) => mergeHoldPr(db, req, true)) },
-    { method: "POST", pattern: "/api/merge/release", operator: true, handler: ok(async (db, req) => mergeHoldPr(db, req, false)) },
-    { method: "POST", pattern: "/api/merge/batch-remove", operator: true, handler: ok(async (db, req) => batchRemovePr(db, req, opts.exec)) },
-    { method: "POST", pattern: "/api/queue/batches/:id/stop", operator: true, handler: ok(async (db, req) => batchStop(db, req, opts.exec)) },
+    { method: "POST", pattern: "/api/merge/hold", handler: ok(async (db, req) => mergeHoldPr(db, req, true)) },
+    { method: "POST", pattern: "/api/merge/release", handler: ok(async (db, req) => mergeHoldPr(db, req, false)) },
+    { method: "POST", pattern: "/api/merge/batch-remove", handler: ok(async (db, req) => batchRemovePr(db, req, opts.exec)) },
+    { method: "POST", pattern: "/api/queue/batches/:id/stop", handler: ok(async (db, req) => batchStop(db, req, opts.exec)) },
     get("/api/repos/:repo/security", security.security),
     post("/api/repos/:repo/security/scans", security.startScan),
     get("/api/security/scans", security.scans),

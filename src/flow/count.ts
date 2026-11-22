@@ -19,6 +19,8 @@ import { cachedQueue, dueActions, dueRefs } from "../core/plan-read.ts";
 import type { QueueState } from "../core/plan.ts";
 import { commentApprovalOf } from "../act/approval.ts";
 import { fixIssueApprovalOf } from "../fixissue/approval.ts";
+import { featureOn } from "../build/features.ts";
+import { ENDED_STATES, LIVE_STATES } from "../implement/types.ts";
 import { approvalOf } from "../labels/approval.ts";
 import { mergeApprovalOf } from "../merge/approval.ts";
 import { pendingDefects } from "../postmerge/select.ts";
@@ -356,21 +358,31 @@ async function priority(c: Ctx): Promise<NodeCount> {
   };
 }
 
-const FIX_STATES = ["retry", "testing", "passed", "pr-opened", "skipped", "failed"] as const;
+/** Where an implementation's state counts on the Implement node. */
+const IMPLEMENT_NODE: Partial<Record<string, string>> = { asked: "asked", stuck: "stuck", "pr-opened": "pr-opened", ...Object.fromEntries([...LIVE_STATES].map((s) => [s, "working"])) };
 
-/** The Fix stage: open issues by where their attempt stands (src/fixissue). */
+/** The Implement stage (id fix): queued issues by where their implementation stands (src/implement). */
 async function fix(c: Ctx): Promise<NodeCount> {
-  const members = new Map<string, Refs>(["candidates", "unapproved", ...FIX_STATES].map((k) => [`fix.${k}`, new Set()]));
+  const members = new Map<string, Refs>(["queued", "asked", "working", "pr-opened", "stuck", "off"].map((k) => [`fix.${k}`, new Set()]));
+  const off = new Set<string>();
   for (const repo of await c.repos()) {
-    const bucket = members.get(await fixIssueApprovalOf(c.db, repo) ? "fix.candidates" : "fix.unapproved")!;
-    for (const r of await dueRefs(c.db, "fixissue", { repo, bucket: "new" })) bucket.add(r);
+    if (await fixIssueApprovalOf(c.db, repo) && await featureOn(c.db, "implement", repo)) for (const r of await dueRefs(c.db, "implement", { repo, bucket: "plan" })) members.get("fix.queued")!.add(r);
+    else off.add(repo);
   }
-  const rows = await c.db.all(c.db.k.selectFrom("main.fix_attempts as a")
-    .innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "a.repo").onRef("i.number", "=", "a.number").on("i.state", "=", "OPEN"))
-    .select(["a.repo", "a.number", "a.state"]).where((eb) => c.tracked(eb, "a.repo")));
-  for (const r of rows) members.get(`fix.${r.state}`)?.add(ref(r));
-  // A skipped issue whose text changed is a candidate again.
-  for (const r of members.get("fix.candidates")!) members.get("fix.skipped")!.delete(r);
+  for (const r of await c.db.all(c.db.k.selectFrom("main.fast_track as f")
+    .innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "f.repo").onRef("i.number", "=", "f.number").on("i.state", "=", "OPEN").on("i.kind", "=", "issue"))
+    .select(["f.repo", "f.number"]).where((eb) => c.tracked(eb, "f.repo")))) {
+    if (off.has(r.repo)) members.get("fix.off")!.add(ref(r));
+  }
+  const rows = await c.db.all(c.db.k.selectFrom("main.implementations as m")
+    .innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "m.repo").onRef("i.number", "=", "m.number").on("i.state", "=", "OPEN"))
+    .select(["m.repo", "m.number", "m.state"]).where("m.state", "not in", [...ENDED_STATES]).where((eb) => c.tracked(eb, "m.repo")));
+  for (const r of rows) {
+    const node = IMPLEMENT_NODE[r.state];
+    if (!node) continue;
+    for (const s of members.values()) s.delete(ref(r));
+    members.get(`fix.${node}`)!.add(ref(r));
+  }
   const total = [...members.values()].reduce((a, s) => a + s.size, 0);
   return {
     counts: { ...Object.fromEntries([...members].map(([k, v]) => [k, v.size])), "fix.total": total, "edge.labels.fix": total, "edge.fix.review": sizeOf(members, "fix.pr-opened") },

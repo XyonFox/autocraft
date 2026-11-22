@@ -18,7 +18,10 @@ export const CARD_KINDS = ["resolution", "comment", "answer", "label", "backlog"
 export const CLOSE_REASONS = ["completed", "not_planned"] as const;
 export type CloseReason = (typeof CLOSE_REASONS)[number];
 export type CardKind = (typeof CARD_KINDS)[number];
-export type TurnKind = "operator" | "opus" | "system";
+/** A person's message: an operator's, or a maintainer's (answered on the maintainer's own Task Runner). */
+export type PersonKind = "operator" | "maintainer";
+export const PERSON_KINDS: readonly PersonKind[] = ["operator", "maintainer"];
+export type TurnKind = PersonKind | "opus" | "system";
 
 export const COMMENT_MAX = 1500;
 /** Longest operator note kept with an answer. */

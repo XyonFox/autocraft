@@ -4,6 +4,7 @@
 #   runner      autocraft-server runner serve (also serves the worker API)
 #   sync        autocraft-server sync [args]             one-shot
 #   backup      deploy/backup.sh [PREFIX [KEEP]]  one-shot, default "daily"
+#   periodic    autocraft-server periodic          sync every minute and the daily backup, while this copy leads them
 #   anything else is passed to the autocraft-server CLI.
 set -euo pipefail
 cd /app
@@ -16,5 +17,6 @@ dashboard) exec "${cli[@]}" dash serve "$@" ;;
 runner) exec "${cli[@]}" runner serve "$@" ;;
 sync) exec "${cli[@]}" sync "$@" ;;
 backup) exec bash deploy/backup.sh "${@:-daily}" ;;
+periodic) exec "${cli[@]}" periodic "$@" ;;
 *) exec "${cli[@]}" "$cmd" "$@" ;;
 esac

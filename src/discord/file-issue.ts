@@ -10,6 +10,7 @@ import { GitHubProvider, type Provider } from "../dash/server/provider.ts";
 import { exec as defaultExec, type Exec } from "../fixup/git.ts";
 import { createReporterIssue, IssueError, labelReporterIssue } from "../github/write.ts";
 import { appChildEnv } from "../github/install-token.ts";
+import { openAppKeys } from "../github/app-keys.ts";
 import { JEV_PROMPTS } from "../prompts/index.ts";
 import { isPublicRepo } from "../public/status.ts";
 import { jevJunk, junkBand, junkState, parseJunk, type JunkAsk } from "./junk-ask.ts";
@@ -100,10 +101,11 @@ async function junkCheck(db: Db, a: JunkAsk, judge: NonNullable<FileHooks["judge
   }
 }
 
-function secretsOf(env = process.env): { box: TokenBox; provider: Provider } | null {
+async function secretsOf(db: Db, env = process.env): Promise<{ box: TokenBox; provider: Provider } | null> {
   try {
     const s = readSecrets(envVar("SECRETS_FILE", env));
-    return s.app ? { box: new TokenBox(s.sessionKey), provider: new GitHubProvider(s.app.clientId, s.app.clientSecret) } : null;
+    const app = (await openAppKeys(db, env))?.current() ?? null;
+    return app ? { box: new TokenBox(s.sessionKey), provider: new GitHubProvider(app.clientId, app.clientSecret) } : null;
   } catch {
     return null;
   }
@@ -120,7 +122,7 @@ export async function fileIssue(deps: FileDeps, req: FileRequest, hooks: FileHoo
   if (!title || !body) return { status: "refused", reason: "The title and the description must not be empty." };
   if (title.length > TITLE_MAX) return { status: "refused", reason: "The title is too long." };
 
-  const keys = hooks.box && hooks.provider ? { box: hooks.box, provider: hooks.provider } : secretsOf();
+  const keys = hooks.box && hooks.provider ? { box: hooks.box, provider: hooks.provider } : await secretsOf(db);
   const baseUrl = (hooks.baseUrl === undefined ? envVar("BASE_URL") ?? null : hooks.baseUrl)?.replace(/\/+$/, "") ?? null;
   if (!keys || !baseUrl) return { status: "refused", reason: "Filing from Discord is not set up." };
 

@@ -1,4 +1,5 @@
 // Mock security deep scan: a running, a capped and a done scan, and findings in several states.
+import { mayRunMock } from "./adminMock";
 import type { Api } from "../client";
 import type { FindingAction, FindingCall, FindingScanTest, FindingState, FindingView, FindingSummary, ScanArea, ScanCall, ScanDetail, ScanView, User } from "../types";
 import { NOW } from "./fixtures";
@@ -9,13 +10,13 @@ const SHA = "3b9d0e51c7a24f68d1e0b9a47c2f5d8e6a1b0c93";
 
 const call = (kind: FindingCall["kind"], minAgo: number, costUsd: number | null, ok = true): FindingCall => ({ kind, at: iso(minAgo), endedAt: iso(minAgo - 3), ok, costUsd });
 
-function scans(): ScanView[] {
+function scans(me: { role: string }): ScanView[] {
   const base = { startedBy: "kiri-n", error: null, endedAt: null };
   return [
-    { ...base, id: 3, repo: "designcraft", commit: "a41f9c02d7e8", findingCount: 1, state: "scanning", capUsd: 15, costUsd: 4.18, estimateUsd: 11.6, areasTotal: 6, areasDone: 2, startedAt: iso(38) },
-    { ...base, id: 2, repo: "designcraft", commit: "9c7e41b0a3d5", findingCount: 2, state: "capped", capUsd: 5, costUsd: 5.03, estimateUsd: 13.2, areasTotal: 9, areasDone: 3, startedAt: iso(3 * 1440), endedAt: iso(3 * 1440 - 41) },
-    { ...base, id: 1, repo: "designcraft", commit: SHA.slice(0, 12), findingCount: 8, state: "done", capUsd: null, costUsd: 11.87, estimateUsd: 12.4, areasTotal: 8, areasDone: 8, startedAt: iso(9 * 1440), endedAt: iso(9 * 1440 - 74) },
-    { ...base, id: 4, repo: "pdfcraft", commit: "5be20d41c9a7", findingCount: 1, state: "capped", capUsd: 6, costUsd: 5.41, estimateUsd: 12.8, areasTotal: 6, areasDone: 2, startedAt: iso(26 * 60), endedAt: iso(25 * 60) },
+    { ...base, id: 3, repo: "designcraft", canAct: mayRunMock(me, "designcraft"), canContinue: mayRunMock(me, "designcraft"), commit: "a41f9c02d7e8", findingCount: 1, state: "scanning", capUsd: 15, costUsd: 4.18, estimateUsd: 11.6, areasTotal: 6, areasDone: 2, startedAt: iso(38) },
+    { ...base, id: 2, repo: "designcraft", canAct: mayRunMock(me, "designcraft"), canContinue: mayRunMock(me, "designcraft"), commit: "9c7e41b0a3d5", findingCount: 2, state: "capped", capUsd: 5, costUsd: 5.03, estimateUsd: 13.2, areasTotal: 9, areasDone: 3, startedAt: iso(3 * 1440), endedAt: iso(3 * 1440 - 41) },
+    { ...base, id: 1, repo: "designcraft", canAct: mayRunMock(me, "designcraft"), canContinue: mayRunMock(me, "designcraft"), commit: SHA.slice(0, 12), findingCount: 8, state: "done", capUsd: null, costUsd: 11.87, estimateUsd: 12.4, areasTotal: 8, areasDone: 8, startedAt: iso(9 * 1440), endedAt: iso(9 * 1440 - 74) },
+    { ...base, id: 4, repo: "pdfcraft", canAct: mayRunMock(me, "pdfcraft"), canContinue: mayRunMock(me, "pdfcraft"), commit: "5be20d41c9a7", findingCount: 1, state: "capped", capUsd: 6, costUsd: 5.41, estimateUsd: 12.8, areasTotal: 6, areasDone: 2, startedAt: iso(26 * 60), endedAt: iso(25 * 60) },
   ];
 }
 
@@ -120,7 +121,14 @@ export function createSecurityMock(me: User, changed: () => void): Pick<Api, "se
   const operator = () => {
     if (me.role !== "operator") throw new Error("only operators act on security findings");
   };
-  const sc = scans();
+  const mayAct = (repo: string) => {
+    if (!mayRunMock(me, repo)) throw new Error("only an operator, or a maintainer with write access to the repo, stops scans and decides findings");
+  };
+  const mayStart = (repo: string, cap: number | null) => {
+    if (!mayRunMock(me, repo)) throw new Error("only an operator, or a maintainer with write access to the repo, starts or continues scans");
+    if (me.role !== "operator" && !(cap !== null && cap > 0)) throw new Error("a spend cap is required: only operators run scans without one");
+  };
+  const sc = scans(me);
   const fs = findings();
   const summary = (f: FindingView): FindingSummary => ({ repo: f.repo, number: f.number, key: f.key, scanId: f.scanId, title: f.title, severity: f.severity, urgent: f.urgent, area: f.area, state: f.state, createdAt: f.createdAt, updatedAt: f.updatedAt, ...(f.scanTest && { scanTest: f.scanTest }) });
   const find = (repo: string, n: number) => {
@@ -132,7 +140,7 @@ export function createSecurityMock(me: User, changed: () => void): Pick<Api, "se
     security: {
       overview: async (repo) => {
         forbidden();
-        return wait({ scans: sc.filter((s) => s.repo === repo).sort((a, b) => b.id - a.id), findings: fs.filter((f) => f.repo === repo).map(summary) });
+        return wait({ canStart: mayRunMock(me, repo), scans: sc.filter((s) => s.repo === repo).sort((a, b) => b.id - a.id), findings: fs.filter((f) => f.repo === repo).map(summary) });
       },
       scans: async (repo) => {
         forbidden();
@@ -145,25 +153,25 @@ export function createSecurityMock(me: User, changed: () => void): Pick<Api, "se
         return wait(detailOf(s, fs));
       },
       startScan: async (repo, capUsd) => {
-        operator();
+        mayStart(repo, capUsd);
         if (sc.some((s) => s.repo === repo && ["modeling", "scanning", "verifying"].includes(s.state))) throw new Error("A scan is already running for this repo");
-        const s: ScanView = { id: Math.max(...sc.map((x) => x.id)) + 1, repo, commit: SHA.slice(0, 12), findingCount: 0, state: "modeling", capUsd, costUsd: 0, estimateUsd: null, areasTotal: 0, areasDone: 0, startedBy: me.login, startedAt: new Date(NOW).toISOString(), endedAt: null, error: null };
+        const s: ScanView = { canAct: mayRunMock(me, repo), canContinue: mayRunMock(me, repo), id: Math.max(...sc.map((x) => x.id)) + 1, repo, commit: SHA.slice(0, 12), findingCount: 0, state: "modeling", capUsd, costUsd: 0, estimateUsd: null, areasTotal: 0, areasDone: 0, startedBy: me.login, startedAt: new Date(NOW).toISOString(), endedAt: null, error: null };
         sc.push(s);
         changed();
         return wait(s);
       },
       stopScan: async (id) => {
-        operator();
         const s = sc.find((x) => x.id === id);
         if (!s) throw new Error("Not found");
+        mayAct(s.repo);
         Object.assign(s, { state: "stopped", endedAt: new Date(NOW).toISOString() });
         changed();
         return wait(s);
       },
       continueScan: async (id, capUsd) => {
-        operator();
         const s = sc.find((x) => x.id === id);
         if (!s) throw new Error("Not found");
+        mayStart(s.repo, capUsd);
         if (s.state !== "capped") throw new Error("only a scan that stopped at its cap can be continued");
         if (capUsd !== null && capUsd <= s.costUsd) throw new Error("the new cap must be above what the scan has spent");
         Object.assign(s, { state: "scanning", capUsd, endedAt: null });

@@ -334,7 +334,7 @@ export async function parseTurn(db: Db, repo: string, n: number, reply: string, 
  * Stores validated choices for a decision: a prepare writes a whole new row, a conversation turn merges into the current one.
  * Call inside the transaction that inserts the turn (`turnId`); `seen` is the item snapshot JSON the turn was written against.
  */
-export async function storeParsedChoices(db: Db, d: DecisionRow, p: ParsedChoices, o: { turnId: number | null; seen: string | null; source: "prepare" | "conversation"; by?: string | null; /** The decision's stamp when the reply's prompt was built. */ stampThen?: string | null }): Promise<void> {
+export async function storeParsedChoices(db: Db, d: DecisionRow, p: ParsedChoices, o: { turnId: number | null; seen: string | null; source: "prepare" | "conversation"; by?: string | null; /** The decision's stamp when the reply's prompt was built. */ stampThen?: string | null; /** The login whose message the reply answered. */ askedBy?: string | null }): Promise<void> {
   // A late reply: the decision was answered, undone or asked again while the call ran.
   const now = await db.get(db.k.selectFrom("main.decisions").select(kx.cols("main.decisions")).$narrowType<{ kind: DecisionRow["kind"] }>().where("id", "=", d.id));
   if (!now || now.answer !== null || (o.stampThen != null && await decisionStamp(db, now) !== o.stampThen)) return;
@@ -343,7 +343,7 @@ export async function storeParsedChoices(db: Db, d: DecisionRow, p: ParsedChoice
   const stamp = await decisionStamp(db, d);
   const by = o.by === undefined ? {} : { by: o.by };
   if (o.source === "conversation") {
-    await mergeChoices(db, d.id, { turnId: o.turnId, stamp, seen, cores: p.cores, add: p.add, drop: p.drop, pick: p.pick }, by);
+    await mergeChoices(db, d.id, { turnId: o.turnId, askedBy: o.askedBy ?? null, stamp, seen, cores: p.cores, add: p.add, drop: p.drop, pick: p.pick }, by);
     return;
   }
   const drafts: ChoicesRow["drafts"] = {};

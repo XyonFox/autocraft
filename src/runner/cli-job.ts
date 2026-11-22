@@ -3,6 +3,7 @@
 // (requested by `cli`, so counted toward the limits and visible on the Pipeline page), and the runner's exec child, whose
 // output is shown here. The writer is an operator (CLI_BY): the guard skips the global switch, the approvals still apply.
 // Commands not listed in CLI_STEPS, and runs with options a step has no parameter for, keep their own direct path.
+import { copyLogs, JOB_LOG_FLUSH_MS, JobLogCopy } from "./job-log.ts";
 import { spawn } from "node:child_process";
 import { closeSync, createWriteStream, mkdirSync, openSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -75,8 +76,10 @@ export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
   closeSync(openSync(logPath, "a"));
   await db.run(db.k.updateTable("jobs").set({ log_path: logPath }).where("id", "=", job));
   const log = createWriteStream(logPath, { flags: "a" });
+  const logCopy = await JobLogCopy.open(db, job, logPath);
+  const copying = setInterval(() => void copyLogs(db, [logCopy]).catch(() => { /* the next copy reads the lines again */ }), JOB_LOG_FLUSH_MS);
   const child = spawn(process.execPath, [fileURLToPath(new URL("../cli.ts", import.meta.url)), "runner", "exec", String(job)], {
-    stdio: ["ignore", "pipe", "pipe"], env: dbEnv(dbTarget()),
+    stdio: ["ignore", "pipe", "pipe"], env: dbEnv(dbTarget()), windowsHide: true,
   });
   await db.run(db.k.updateTable("jobs").set({ pid: child.pid ?? null }).where("id", "=", job));
   child.stdout.on("data", (b: Buffer) => { log.write(b); process.stdout.write(b); });
@@ -85,8 +88,10 @@ export async function runCliJob(db: Db, req: CliRequest): Promise<number> {
   let spawnError: string | null = null;
   child.on("error", (e) => (spawnError = e.message));
   const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => child.on("close", (c, s) => resolve([c, s])));
-  log.end();
+  clearInterval(copying);
+  await new Promise<void>((resolve) => log.end(resolve));
   const r = await endJob(db, job, code, signal, spawnError);
+  await copyLogs(db, [logCopy], true).catch((e: Error) => console.error(`job ${job}: log not stored: ${e.message}`));
   console.error(`job ${job}: ${r?.state ?? "ended"}${r?.error ? `: ${r.error}` : ""}`);
   return r?.state === "done" ? 0 : 1;
 }

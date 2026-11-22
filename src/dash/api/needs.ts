@@ -1,7 +1,7 @@
 // "Needs you": feedback people left that nobody has answered, and what the pipeline stopped. Decisions have their own API.
 // Dashboard users' text is shown here and never read by a prompt.
 import type { NeedsFeedbackPage, NeedsFeedbackRow, NeedsFixPage, NeedsPage, NeedsStoppedRow } from "../../../web/src/api/types.ts";
-import { listAccounts } from "../../agents/accounts.ts";
+import { accountListOrNull } from "../../agents/account-actions.ts";
 import { getDecision, reposOf } from "../../decisions.ts";
 import { needingExpr, touchesQuiet, withoutHiddenExpr } from "./decisions.ts";
 import { zeroLimits } from "./limits.ts";
@@ -18,6 +18,9 @@ import { isQuiet } from "../../security/quiet.ts";
 import { canSeeInternals } from "./staff.ts";
 import type { SelectQueryBuilder, SqlBool } from "kysely";
 import { filterSeq, mapSeq, reduceSeq } from "../../async-seq.ts";
+import { mayResumeTrip } from "../../push-outcomes.ts";
+import { parseTripKey } from "../../core/push-outcome.ts";
+import { stepTitle } from "./trace.ts";
 import type { Db } from "../../db/index.ts";
 import * as kx from "../../db/kx.ts";
 import { setting } from "../../settings-read.ts";
@@ -159,16 +162,20 @@ async function view(db: Db, r: Raw): Promise<NeedsFeedbackRow> {
   return { id: r.id, source: r.source, item, author: r.author, at: r.at, text: r.text, href, hrefLabel, handled: !!r.handled };
 }
 
-const humanize = (id: string): string => { const t = id.replace(/[-_]+/g, " ").trim(); return t.charAt(0).toUpperCase() + t.slice(1); };
 
-export async function stopped(db: Db, hidden: HiddenRepos): Promise<NeedsStoppedRow[]> {
+export async function stopped(db: Db, hidden: HiddenRepos, user: Req["user"]): Promise<NeedsStoppedRow[]> {
   const out: NeedsStoppedRow[] = [];
-  for (const t of await db.all(db.k.selectFrom("stage_trips").select(["stage", "reason", "tripped_at"]).where("active", "=", 1).orderBy("tripped_at")))
-    out.push({ id: `breaker:${t.stage}`, kind: "breaker", title: humanize(t.stage), reason: blankIfHidden(t.reason, hidden), since: t.tripped_at, resume: { type: "trip", stage: t.stage } });
+  // One row per tripped repo of a push stage, one per push stage tripped on every repo (no repo), and the outside-author surge breaker.
+  for (const t of await db.all(db.k.selectFrom("stage_trips").select(["stage", "reason", "tripped_at"]).where("active", "=", 1).orderBy("tripped_at").orderBy("stage"))) {
+    const k = parseTripKey(t.stage);
+    if (k && isHiddenRepo(hidden, k.repo)) continue;
+    out.push({ id: `breaker:${t.stage}`, kind: "breaker", title: stepTitle(k?.stage ?? t.stage), ...(k ? { repo: k.repo } : {}), reason: blankIfHidden(t.reason, hidden), since: t.tripped_at,
+      resume: { type: "trip", stage: t.stage, canResume: await mayResumeTrip(user, t.stage) } });
+  }
   const updated = new Map((await db.all(db.k.selectFrom("stage_limits").select(["step", "updated_at"]))).map((r) => [r.step, r.updated_at]));
   for (const l of await zeroLimits(db))
     out.push({ id: `limit:${l.step}`, kind: "limit", title: l.title, reason: "The daily limit is 0", since: updated.get(l.step) ?? null, resume: { type: "link", to: "/pipeline" } });
-  for (const a of await listAccounts(db))
+  for (const a of await accountListOrNull(db) ?? [])
     if (a.enabled && a.pausedReason) out.push({ id: `account:${a.id}`, kind: "account", title: a.label, reason: blankIfHidden(a.pausedReason, hidden), since: null, resume: { type: "link", to: "/accounts" } });
   // Targets Act stopped after repeated failures, while the answer still stands: an operator retries them from here.
   for (const a of await db.all(db.k.selectFrom("main.actions as a").innerJoin("main.decisions as d", "d.id", "a.decision_id").innerJoin("main.items as i", (j) => j.onRef("i.repo", "=", "a.repo").onRef("i.number", "=", "a.number"))
@@ -243,7 +250,7 @@ export async function needs(db: Db, req: Req): Promise<NeedsPage> {
   // The same filter as the Needs you list: what this person settles, plus the disputes they resolve; a batch counts only when none of its items is in a hidden repo.
   const decisions = (await db.get(db.k.selectFrom("decisions").select((eb) => eb.fn.countAll<number>().as("n")).where((eb) => needingExpr(db, eb, req))
     .$if(filtered(hidden), (q) => q.where((eb) => withoutHiddenExpr(db, eb, hidden)!))))!.n;
-  const rows = await stopped(db, hidden);
+  const rows = await stopped(db, hidden, req.user);
   const last = fb.rows[fb.rows.length - 1];
   return {
     counts: { decisions, feedback: fb.unhandled, stopped: rows.length },

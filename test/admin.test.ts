@@ -133,6 +133,23 @@ describe("admin api", () => {
     await boss.post("/api/contributors/steady/override", { status: null });
   });
 
+  test("a maintainer with write access switches that repo's pipeline; one without, and a viewer, cannot; the global switch stays with operators", async () => {
+    await addLogin(db, "cli", "maint-w", "maintainer", null);
+    writeFileSync(permsFile, JSON.stringify({ "maint-w": { photocraft: "write" }, maint: { photocraft: "read" } }));
+    const writer = await signedIn("maint-w");
+    const listed = await writer.get<TrackedRepo[]>("/api/repos/all");
+    assert.equal(listed.find((r) => r.name === "photocraft")?.canSwitch, true);
+    const on = await writer.post<TrackedRepo>("/api/repos/pipeline-on", { name: "photocraft" });
+    assert.equal(on.pipeline, true);
+    for (const login of ["maint", "viewer1"]) {
+      const c = await signedIn(login);
+      await c.post("/api/repos/pipeline-off", { name: "photocraft" }, 403);
+    }
+    assert.equal((await (await signedIn("maint")).get<TrackedRepo[]>("/api/repos/all")).find((r) => r.name === "photocraft")?.canSwitch, false);
+    await writer.json("PUT", "/api/pipeline/state", { enabled: true }, 403);
+    assert.equal((await writer.post<TrackedRepo>("/api/repos/pipeline-off", { name: "photocraft" })).pipeline, false);
+  });
+
   test("an override changes the effective status and is audited without its note", async () => {
     const boss = await signedIn("boss");
     let c = row(await boss.get<ContributorList>("/api/contributors"), "veteran");

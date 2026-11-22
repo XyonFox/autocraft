@@ -168,7 +168,7 @@ test("search results GitHub refuses for lack of access are dropped; other errors
 
 // ---- mergeable keeps its known value at one head ----
 import { tmpdir } from "node:os";
-import { saveChecks } from "../src/review/checks.ts";
+import { saveChecks, type PrChecks } from "../src/review/checks.ts";
 import type { Db } from "../src/db/index.ts";
 import { connectDb } from "../src/db/open.ts";
 
@@ -183,6 +183,51 @@ test("saveChecks keeps a known mergeable at the same head and replaces it at a n
   assert.equal(await stored(), "MERGEABLE");
   await save("h2", "UNKNOWN");
   assert.equal(await stored(), "UNKNOWN");
+});
+
+test("saveChecks of many PRs records waiting runs, settles pushes and follows unknown merge states, and the reread marks a PR stuck", async () => {
+  const { rereadUnknown, unknownOf, READS_BEFORE_REQUEST } = await import("../src/merge/mergeable.ts");
+  const db = await connectDb(join(mkdtempSync(join(tmpdir(), "checks-many-")), "t.db"));
+  const at = "2026-11-01T00:00:00Z";
+  const prs = Array.from({ length: 30 }, (_, i) => i + 1);
+  for (const n of prs) await db.run(db.k.insertInto("items").values({ repo: "app", number: n, kind: "pr", state: n === 30 ? "CLOSED" : "OPEN", title: "t", author: "a", head_oid: `h${n}`, created_at: at, updated_at: at }));
+  // #3 and #4 are reviewed take at their heads.
+  for (const n of [3, 4]) await db.run(db.k.insertInto("opus_reviews").values({ repo: "app", number: n, head_oid: `h${n}`, at, model: "opus", mode: "full", verdict: "take", sure: 1, reason: "r", seen_at: at }));
+  await db.run(db.k.insertInto("push_outcomes").values({ at: new Date().toISOString(), stage: "fixup", action: "fixup-push", repo: "app", number: 5, from_oid: "old", to_oid: "h5", before_res: "green" }));
+  const row = (n: number): PrChecks => ({
+    repo: "app", number: n, head_oid: `h${n}`, state: "OPEN", is_draft: false, overall: n === 5 ? "failure" : "success", checks: [{ name: "gate", state: n === 5 ? "failure" : "success" }],
+    mergeable: n === 3 ? "UNKNOWN" : "MERGEABLE", maintainer_can_modify: true,
+    suites: n === 2 ? [{ id: 77, name: "ci", event: "pull_request", status: "COMPLETED", conclusion: "ACTION_REQUIRED" }] : [],
+  });
+  const save = async () => await saveChecks(db, prs.slice(0, 29).map(row));
+  for (let i = 0; i < READS_BEFORE_REQUEST; i++) await save();
+  assert.equal((await db.all(db.k.selectFrom("pr_checks").select("number").where("repo", "=", "app"))).length, 29);
+  const runs = await db.all(db.k.selectFrom("ci_run_approvals").select(["number", "runs"]));
+  assert.deepEqual(runs.map((r) => [r.number, (JSON.parse(r.runs) as { id: number }[]).map((x) => x.id)]), [[2, [77]]], "only the PR with a run held for approval gets a row");
+  assert.equal((await db.get(db.k.selectFrom("push_outcomes").select("outcome").where("to_oid", "=", "h5")))!.outcome, "broke");
+  assert.equal((await unknownOf(db, "app", 3, "h3"))?.reads, READS_BEFORE_REQUEST, "each read of the unknown state counts");
+  assert.equal(await unknownOf(db, "app", 4, "h4"), null, "a known state is not followed");
+  // A note left for a closed PR goes; the unknown one is requested and, with no answer, marked stuck.
+  await db.run(db.k.insertInto("main.settings").values({ key: "mergeable_unknown:app#30", value: JSON.stringify({ head: "h30", since: at, reads: 9, rereads: 0, stuck: false }) }));
+  const asked: number[] = [];
+  const done = await rereadUnknown(db, { query: async () => { throw new Error("no GitHub read expected"); } } as never, "app", () => {}, async (_repo, n) => { asked.push(n); return null; });
+  assert.deepEqual([done, asked], [[3], [3]]);
+  assert.equal((await unknownOf(db, "app", 3, "h3"))?.stuck, true);
+  assert.equal(await db.get(db.k.selectFrom("main.settings").select("key").where("key", "=", "mergeable_unknown:app#30")), undefined);
+  // GitHub now reports #3 as mergeable: the note goes.
+  await saveChecks(db, [{ ...row(3), mergeable: "MERGEABLE" }]);
+  assert.equal(await unknownOf(db, "app", 3, "h3"), null);
+  // A failing query still stores the rows the earlier queries read.
+  const { refreshChecks, CHECKS_PER_QUERY } = await import("../src/review/checks.ts");
+  let queries = 0;
+  const failing = { query: async (q: string) => {
+    if (queries++) throw new Error("GitHub is down");
+    const nums = [...q.matchAll(/pullRequest\(number: (\d+)\)/g)].map((m) => Number(m[1]));
+    return { repository: Object.fromEntries(nums.map((n) => [`pr${n}`, { number: n, state: "OPEN", isDraft: false, headRefOid: "new", mergeable: "MERGEABLE", maintainerCanModify: true }])) };
+  } };
+  const many = Array.from({ length: CHECKS_PER_QUERY + 1 }, (_, i) => 101 + i);
+  await assert.rejects(refreshChecks(db, failing as never, "app", many), /GitHub is down/);
+  assert.equal((await db.all(db.k.selectFrom("pr_checks").select("number").where("head_oid", "=", "new"))).length, CHECKS_PER_QUERY);
 });
 
 test("the open-PR references follow an edit of the PR's text, from sync and from any other writer", async () => {

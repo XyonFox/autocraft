@@ -7,6 +7,7 @@ import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { hiddenRepos, needVisible } from "./visible.ts";
 import type { Db } from "../../db/index.ts";
+import { mayRunRepo } from "../repo-access.ts";
 
 const operator = (req: Req, what: string): void => {
   if (req.user.role !== "operator") throw new HttpError(403, `only operators ${what}`);
@@ -27,10 +28,10 @@ export async function putLimits(db: Db, req: Req) {
   return await wrap(async () => await setOutsideLimits(db, req.user.login, req.json));
 }
 
-/** Operator: exempts one held item. */
+/** Exempts one held item; the requester must run the repo. */
 export async function release(db: Db, req: Req) {
-  operator(req, "release an item");
   const repo = req.params.repo!;
+  if (!(await mayRunRepo(req.user, repo))) throw new HttpError(403, "no write access to this repo");
   const n = Number(req.params.n);
   if (!Number.isInteger(n)) throw new HttpError(400, "not an item number");
   await needVisible(db, req, repo);

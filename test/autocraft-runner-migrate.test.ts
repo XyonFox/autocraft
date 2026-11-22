@@ -180,7 +180,7 @@ test("login --no-wait keeps the new credential and prints the approval link; log
   } finally { await srv.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a server that refuses protocol 4 is asked again with protocol 3, without a held wait", async () => {
+test("a server that refuses the current protocol is asked again with each older one, protocol 3 without a held wait", async () => {
   const seen: { protocol: number, wait?: number }[] = [];
   const srv = await fakeServer((_path, body, _req, res) => {
     seen.push({ protocol: body.protocol, ...(body.wait !== undefined && { wait: body.wait }) });
@@ -192,7 +192,7 @@ test("a server that refuses protocol 4 is asked again with protocol 3, without a
     const r = await helper.claimRequest(srv.url, "acrun_x", base);
     assert.deepEqual(r, { lease: null, retryAfter: 5, reserve: { fiveHour: 20, weekly: 20 } });
     await helper.claimRequest(srv.url, "acrun_x", { ...base, requestId: "r2" });
-    assert.deepEqual(seen, [{ protocol: 4, wait: helper.CLAIM_WAIT_S }, { protocol: 3 }, { protocol: 3 }]);
+    assert.deepEqual(seen, [{ protocol: helper.PROTOCOL_VERSION, wait: helper.CLAIM_WAIT_S }, { protocol: 4, wait: helper.CLAIM_WAIT_S }, { protocol: 3 }, { protocol: 3 }]);
   } finally { await srv.close(); }
 });
 

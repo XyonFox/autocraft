@@ -26,7 +26,8 @@ export type KPod = {
     containerStatuses?: ContainerStatus[];
   };
 };
-export type KPvc = { metadata: { name: string; labels?: Record<string, string> } };
+export type KPvc = { metadata: { name: string; labels?: Record<string, string>; deletionTimestamp?: string } };
+export type KNode = { metadata: { name: string }; status?: { conditions?: { type: string; status: string; lastTransitionTime?: string }[] } };
 
 export interface KubeApi {
   listPods(ns: string, selector: string): Promise<KPod[]>;
@@ -37,6 +38,8 @@ export interface KubeApi {
   listPvcs(ns: string, selector: string): Promise<KPvc[]>;
   createPvc(ns: string, pvc: object): Promise<void>;
   deletePvc(ns: string, name: string): Promise<void>;
+  /** The node, or null when there is none of that name. Throws (403) when the service account may not read nodes. */
+  getNode(name: string): Promise<KNode | null>;
   /** A SelfSubjectAccessReview: whether this service account may `verb` the `resource` in `ns`. */
   canI(ns: string, verb: string, resource: string): Promise<boolean>;
   /**
@@ -45,6 +48,18 @@ export interface KubeApi {
    * an ExecResult.
    */
   exec(ns: string, pod: string, container: string, argv: string[], opts: ExecOptions): Promise<ExecResult>;
+}
+
+/** `api` with `guard` awaited before every call that changes the cluster or runs a command in it (a fenced leader's check). */
+export function guardedApi(api: KubeApi, guard: () => Promise<void>): KubeApi {
+  return {
+    ...api,
+    createPod: async (ns, pod) => (await guard(), await api.createPod(ns, pod)),
+    deletePod: async (ns, name) => (await guard(), await api.deletePod(ns, name)),
+    createPvc: async (ns, pvc) => (await guard(), await api.createPvc(ns, pvc)),
+    deletePvc: async (ns, name) => (await guard(), await api.deletePvc(ns, name)),
+    exec: async (ns, pod, container, argv, opts) => (await guard(), await api.exec(ns, pod, container, argv, opts)),
+  };
 }
 
 export type ExecOptions = {
@@ -149,6 +164,10 @@ export function kubeApi(conn: KubeConn | (() => KubeConn)): KubeApi {
     listPvcs: async (ns, selector) => (JSON.parse(await call("GET", `${pvcs(ns)}?labelSelector=${enc(selector)}`)) as { items: KPvc[] }).items,
     createPvc: async (ns, pvc) => void (await call("POST", pvcs(ns), pvc)),
     deletePvc: (ns, name) => call("DELETE", `${pvcs(ns)}/${enc(name)}`).then(() => {}, gone),
+    getNode: (name) => call("GET", `/api/v1/nodes/${enc(name)}`).then((t) => JSON.parse(t) as KNode, (e: unknown) => {
+      if (e instanceof KubeError && e.status === 404) return null;
+      throw e;
+    }),
     canI: async (ns, verb, resource) => {
       const r = JSON.parse(await call("POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", {
         apiVersion: "authorization.k8s.io/v1", kind: "SelfSubjectAccessReview", spec: { resourceAttributes: { namespace: ns, verb, resource } },

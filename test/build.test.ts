@@ -10,6 +10,7 @@ import { sniff } from "../src/build/artifacts.ts";
 import { authenticate, createEnv, hello, listEnvs, rotateKey, updateEnv } from "../src/build/envs.ts";
 import { appendLog, MAX_LOG_BYTES, cancelTask, claim, createTask, getTask } from "../src/build/tasks.ts";
 import { startWorkerServer } from "../src/build/worker-api.ts";
+import { useRunnerClient } from "../src/remote/runner-client.ts";
 import { apiRoutes } from "../src/dash/api/index.ts";
 import { loadConfig } from "../src/dash/server/config.ts";
 import { startServer } from "../src/dash/server/index.ts";
@@ -270,6 +271,26 @@ describe("dashboard API", () => {
     assert.equal((await v.send(`/api/tasks/${id}/artifacts/..%2F..%2Fbuild.db`)).status, 404);
     const hidden = await task({ repo: "vault" });
     assert.equal((await v.send(`/api/tasks/${hidden}/artifacts/x.txt`)).status, 404);
+
+    // A dashboard without the artifact directory fetches the bytes from the runner, after the same checks.
+    const key = "k".repeat(40);
+    const runner = await startWorkerServer({ db, listen: "127.0.0.1:0", internalKey: key });
+    const paths: string[] = [];
+    runner.server.prependListener("request", (req) => paths.push(req.url ?? ""));
+    useRunnerClient({ url: runner.url, sessionKey: key });
+    try {
+      const got = await v.send(`/api/tasks/${id}/artifacts/page.html`);
+      assert.equal(got.status, 200);
+      assert.equal(got.headers.get("content-security-policy"), "sandbox");
+      assert.equal(await got.text(), "<script>alert(1)</script>");
+      assert.equal((await v.send(`/api/tasks/${id}/artifacts/missing.txt`)).status, 404);
+      assert.equal((await v.send(`/api/tasks/${hidden}/artifacts/x.txt`)).status, 404);
+      assert.deepEqual(paths, [`/internal/artifacts/${id}/page.html`], "the runner is asked only after the dashboard's checks pass");
+      assert.equal((await fetch(`${runner.url}/internal/artifacts/${id}/page.html`)).status, 401, "an unsigned request");
+    } finally {
+      useRunnerClient(null);
+      await runner.close();
+    }
   });
 });
 

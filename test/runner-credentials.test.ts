@@ -54,7 +54,7 @@ test("older tokens a helper used become runners, the others connectors, and can_
   await db.close();
 });
 
-test("a claim keeps the helper's protocol; only protocol 4 carries a wait", () => {
+test("a claim keeps the helper's protocol; protocol 3 carries no wait", () => {
   const base = { requestId: "test-claim-0001", helperVersion: "1.3.0", harness: "claude", harnessVersion: "2.1", tiers: { top: "opus" } };
   const v3 = parseClaim({ ...base, protocol: 3, wait: 25 });
   assert.equal(v3.protocol, 3);
@@ -65,7 +65,8 @@ test("a claim keeps the helper's protocol; only protocol 4 carries a wait", () =
   assert.equal(parseClaim({ ...base, protocol: 4 }).wait, undefined);
   assert.throws(() => parseClaim({ ...base, protocol: 4, wait: 31 }), (e) => e instanceof HttpError && e.status === 400);
   assert.throws(() => parseClaim({ ...base, protocol: 4, wait: 2.5 }), (e) => e instanceof HttpError && e.status === 400);
-  assert.throws(() => parseClaim({ ...base, protocol: 5 }), (e) => e instanceof HttpError && e.status === 409);
+  assert.equal(parseClaim({ ...base, protocol: 5, wait: 25 }).wait, 25);
+  assert.throws(() => parseClaim({ ...base, protocol: PROTOCOL_VERSION + 1 }), (e) => e instanceof HttpError && e.status === 409);
 });
 
 describe("over HTTP", async () => {

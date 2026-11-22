@@ -37,7 +37,7 @@ export const BOOKKEEPING_SETTINGS = [
   "full_sync_cursor", "org_high_water", "main_ci_polled_at", "releases_polled_at", "releases_offset", "search_catchup_at", "repos_refreshed_at", "sync_rate_remaining", "sync_rate_reset_at",
   "flow_summary_marks", "liveness_at", "liveness_open", "classify_run", "worker_update_pending", "worker_update_failures",
 ];
-const BOOKKEEPING_SETTING_LIKE = ["%\\_points\\_last\\_run", "pipeline\\_fp:%", "build\\_feature:%", "pr\\_builds\\_%"];
+const BOOKKEEPING_SETTING_LIKE = ["leader:%", "%\\_points\\_last\\_run", "pipeline\\_fp:%", "build\\_feature:%", "pr\\_builds\\_%"];
 
 /** SQL condition on `key` that is true for the settings that matter to a page. */
 function shownSettings(key: string): string {
@@ -95,7 +95,9 @@ export const TOPIC_TABLES: Record<string, Source[]> = {
   conversations: [{ table: "conversations" }, { table: "conversation_turns" }, { table: "conversation_cards" }],
   // Follow-up issues held until the merge; the Act lane reads the item, decision and pre-approval rows that move them, so not planner input.
   "held-followups": [{ table: "held_followups" }],
-  fixes: [{ table: "fix_attempts" }, { table: "patch_checks" }, { table: "dupe_carries" }],
+  // Implementations and the Implement switches are planner input: a queued issue's next step reads them.
+  fixes: [{ table: "fix_attempts" }, { table: "patch_checks" }, { table: "dupe_carries" }, { table: "implementations" }, { table: "implementation_rounds" },
+    { table: "settings", when: "new_key LIKE 'build\\_feature:implement%' ESCAPE '\\'" }],
   verify: [{ table: "verifications" }, { table: "fixups" }, { table: "ci_fixes" }],
   // Pre-approved merges and the operator fix-ups behind them: the planner works them, so the topic is planner input.
   preapprovals: [{ table: "preapprovals" }, { table: "operator_fixups" }],
@@ -119,7 +121,7 @@ export const TOPIC_TABLES: Record<string, Source[]> = {
     { table: "dupe_group_items" }, { table: "item_rank" }, { table: "classifications", ops: ["INSERT", "DELETE"] },
     { table: "classifications", ops: ["UPDATE"], when: ["classifier", "run_id", "at", "type_label", "want", "reference", "flags", "dup_of", "reason", "probs", "input_hash"].map((c) => `old.${c} IS NOT new.${c}`).join(" OR ") },
     { table: "opus_reviews" }, { table: "verifications" },
-    { table: "fix_attempts" }, { table: "postmerge_followups" }, { table: "premerge_reviews" }, { table: "pr_checks" }, { table: "push_outcomes" }, { table: "stage_trips" }, { table: "fast_track" }, { table: "merge_holds" }, { table: "merges" }, { table: "merge_batches" },
+    { table: "fix_attempts" }, { table: "implementations" }, { table: "postmerge_followups" }, { table: "premerge_reviews" }, { table: "pr_checks" }, { table: "push_outcomes" }, { table: "stage_trips" }, { table: "fast_track" }, { table: "merge_holds" }, { table: "merges" }, { table: "merge_batches" },
     { table: "merge_batch_prs" }, { table: "tracked_repos" },
     { table: "settings", when: "new_key IN ('pilot_items', 'classify_run', 'pipeline_login')" },
   ],
@@ -193,8 +195,11 @@ export function liveTriggers(columns?: Map<string, string[]>): LiveTrigger[] {
   for (const [topic, sources] of Object.entries(TOPIC_TABLES)) {
     for (const { table, ops = ALL_OPS, when } of sources) {
       for (const op of ops) {
-        // `steps`, `trace`, `limits`, `decision-snooze`, `build-features` and `remote-queue` read tables other topics already watch; their triggers need names of their own.
-        const name = `live_${topic === "steps" || topic === "trace" || topic === "limits" || topic === "decision-snooze" || topic === "build-features" || topic === "remote-queue" || topic === "rank-inputs" ? `${topic.replace(/\W/g, "_")}_` : ""}${table}_${op[0]!.toLowerCase()}`;
+        // `steps`, `trace`, `limits`, `decision-snooze`, `build-features` and `remote-queue` read tables other topics already watch, and a
+        // settings source outside the `settings` topic reads that topic's table; their triggers need names of their own.
+        const own = topic === "steps" || topic === "trace" || topic === "limits" || topic === "decision-snooze" || topic === "build-features" || topic === "remote-queue" || topic === "rank-inputs"
+          || (table === "settings" && topic !== "settings");
+        const name = `live_${own ? `${topic.replace(/\W/g, "_")}_` : ""}${table}_${op[0]!.toLowerCase()}`;
         const key = op === "DELETE" ? "old.key" : "new.key";
         let cond = when ? when.replaceAll("new_key", key) : "";
         if (op === "UPDATE" && !when) {

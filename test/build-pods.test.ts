@@ -48,6 +48,7 @@ class FakeKube implements KubeApi {
   async listPvcs(_ns: string, sel: string) { return [...this.pvcs.values()].filter((v) => matches(v.metadata.labels, sel)); }
   async createPvc(_ns: string, pvc: object) { this.#refused("pvc", pvc); const v = structuredClone(pvc) as { metadata: { name: string } }; this.pvcs.set(v.metadata.name, v); }
   async deletePvc(_ns: string, name: string) { this.pvcs.delete(name); }
+  async getNode() { return null; }
   async canI() { return true; }
   /** What the next execs return, and the argv of each call. */
   execResult: ExecResult = { exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), truncated: false };

@@ -1,9 +1,10 @@
-// The overflow menu on a Queue row: fast track and its weight, merge hold, Backlog and, for batch members, remove from batch. Operators only.
+// The overflow menu on a Queue row: fast track and its weight, merge hold, Backlog and, for batch members, remove from batch. Whoever runs the repo.
 import { DropdownMenu } from "radix-ui";
 import { ArchiveIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, FastForwardIcon, PauseIcon, PlayIcon, ScalesIcon, SignOutIcon } from "@phosphor-icons/react";
 import { useApi } from "../../api/client";
 import type { FastPosition } from "../../api/types";
 import { useUser } from "../../shell/UserContext";
+import { canRun } from "../../registry/permissions";
 import { cn } from "../../ui/cn";
 import { ErrorLine, useWrite } from "../admin/parts";
 import { refOf, WEIGHT_DEFAULT, WEIGHTS } from "./fastTrack";
@@ -15,7 +16,7 @@ const itemCls = "flex h-8 cursor-default items-center gap-2.5 rounded px-2 text-
 export function RowMenu({ repo, number, fast, held, pr, inBatch, backlog }: { repo: string; number: number; fast: FastPosition | null; held: boolean; pr: boolean; inBatch?: boolean; backlog?: boolean }) {
   const api = useApi();
   const write = useWrite();
-  if (useUser().role !== "operator") return null;
+  if (!canRun(useUser(), repo)) return null;
   const ref = refOf(repo, number);
   const run = (key: string, f: () => Promise<unknown>) => () => void write.run(key, f);
   return (

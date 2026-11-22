@@ -1,3 +1,5 @@
+import { envVar } from "../../env.ts";
+
 // A refusal with a status code; the server renders it as a page, or as JSON
 // under /api/.
 export class HttpError extends Error {
@@ -65,6 +67,23 @@ export function trimKeys<V>(map: Map<string, V>, now: number, last: number, ever
 
 // Fixed-window counters, in memory: limits reset with the process, which is
 // enough to slow down a loop or a stuck client.
+/**
+ * Dashboard replicas (AUTOCRAFT_DASH_REPLICAS, default 1). Every replica keeps its rate limits in memory, so each takes
+ * `share` of a limit and the replicas together allow about what one dashboard allows (rounded down, at least 1).
+ */
+export function dashReplicas(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = envVar("DASH_REPLICAS", env) ?? "";
+  if (raw === "") return 1;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 100) throw new Error("AUTOCRAFT_DASH_REPLICAS must be a whole number from 1 to 100");
+  return n;
+}
+
+/** This replica's part of a count limit. */
+export const share = (limit: number, replicas = dashReplicas()): number => Math.max(1, Math.floor(limit / replicas));
+/** This replica's part of a refill rate. */
+export const shareRate = (perSec: number, replicas = dashReplicas()): number => perSec / replicas;
+
 export class RateLimiter {
   #hits = new Map<string, { start: number; n: number }>();
   #limit: number;

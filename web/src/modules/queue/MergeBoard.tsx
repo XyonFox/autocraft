@@ -6,6 +6,7 @@ import { Fragment, useEffect, useMemo } from "react";
 import { useApi } from "../../api/client";
 import type { FastPosition, NextMerge, QueueBatch, QueueOrigin, QueuePendingRow, QueueRow, QueueState } from "../../api/types";
 import { useUser } from "../../shell/UserContext";
+import { canRun } from "../../registry/permissions";
 import { Badge } from "../../ui/atoms/Badge";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { WorkableGroup, WorkableRow, WorkableTable, type WorkableColumn } from "../../ui/organisms/Workable";
@@ -166,7 +167,7 @@ function PendingRow({ r }: { r: QueuePendingRow }) {
 function StopBatch({ b }: { b: QueueBatch }) {
   const api = useApi();
   const write = useWrite();
-  if (useUser().role !== "operator") return null;
+  if (!canRun(useUser(), b.repo)) return null;
   return (
     <>
       <ErrorLine error={write.error} className="text-2xs" />

@@ -1,5 +1,6 @@
 // HTTP server: sign-in, sessions, CSRF, rate limits, security headers and
 // routing for the dashboard. Handlers only ever see authenticated requests.
+import { AppKeys, bindSecrets, useAppKeys } from "../../github/app-keys.ts";
 import { maintainerWritesOn } from "../../settlers.ts";
 import { readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -46,12 +47,14 @@ import { isBusy } from "../../db.ts";
 import { inferenceMode } from "../../remote/mode.ts";
 import { hasFreshRunner, parseStatus, storeStatus } from "../../remote/helpers.ts";
 import { addressKey, parseLoginStart, pollLogin, startLogin } from "../../remote/device-login.ts";
-import { ENCODINGS, ROUTES, type ClaimReply, type LoginPollReply, type LoginStartReply, type StatusReply, type ToolReply } from "../../remote/protocol.ts";
+import { ENCODINGS, ROUTES, toolContent, type ClaimReply, type LoginPollReply, type LoginStartReply, type StatusReply, type ToolReply } from "../../remote/protocol.ts";
 import { userReserve } from "../../remote/reserve.ts";
 import { startLiveness } from "../../remote/liveness.ts";
-import { archiveOf, callTaskTool, TASK_TOOLS, taskLease, type TaskLease, type ToolResult } from "../../remote/tools.ts";
+import { WORKSPACE_SERVER } from "../../build/workspace-tools.ts";
+import { archiveOf, callTaskTool, LeaseGone, runnerUrl, TASK_TOOLS, taskLease, type TaskLease, type ToolResult } from "../../remote/tools.ts";
+import { useRunnerClient } from "../../remote/runner-client.ts";
 import { handleDelivery, WEBHOOK_BODY_LIMIT, WEBHOOK_PATH } from "../../github/webhooks.ts";
-import { esc, HttpError, parseCookies, plainPage, previewTags, RateLimiter, safeReturnTo } from "./util.ts";
+import { esc, HttpError, parseCookies, plainPage, previewTags, RateLimiter, safeReturnTo, share, shareRate } from "./util.ts";
 import { exclusive } from "../../async-seq.ts";
 import { refreshReadIdentity } from "../../github/read.ts";
 import type { Db } from "../../db/index.ts";
@@ -65,6 +68,9 @@ const BODY_LIMIT = 64 * 1024;
 const SUBMIT_BODY_LIMIT = 8 * 1024 * 1024;
 /** A task tool call: a `check` call carries the whole patch, as the local bridge allows. */
 const TOOL_BODY_LIMIT = 2 * 1024 * 1024;
+/** A workspace `write` carries a file of up to 2 MiB, which JSON escaping can make several times larger. */
+const WORKSPACE_BODY_LIMIT = 12 * 1024 * 1024;
+const toolBodyLimit = (server: string): number => (server === WORKSPACE_SERVER ? WORKSPACE_BODY_LIMIT : TOOL_BODY_LIMIT);
 const HELPER_FILE = new URL("../../../worker/autocraft.mjs", import.meta.url);
 const PUBLIC_FILES = new Set(["/artcraft-mark.svg", "/artcraft-mark.png"]);
 const FILE_TYPES: Record<string, string> = {
@@ -231,6 +237,13 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
   const resealed = await resealLegacyValues(db, box);
   const resealedTotal = Object.values(resealed).reduce((a, b) => a + b, 0);
   if (resealedTotal) console.log(`re-sealed ${resealedTotal} stored token values under the current key (${Object.entries(resealed).map(([t, n]) => `${t} ${n}`).join(", ")})`);
+  // The GitHub App's keys live in the database, imported once from the secrets file; `config.secrets.app` reads them.
+  const dbAppKeys = await new AppKeys(db, box, config.secretsFile).load();
+  bindSecrets(config.secrets, dbAppKeys);
+  useAppKeys(dbAppKeys);
+  // Without the runner's disk, build artifacts and the Claude accounts are asked of the runner (src/remote/runner-client.ts).
+  const runnerBase = runnerUrl();
+  useRunnerClient(runnerBase ? { url: runnerBase, sessionKey: config.secrets.sessionKey } : null);
   // The GitHub App's own provider: it signs users in under login=github-app, and always makes and refreshes their user tokens (the "act as you" authorization).
   // Read at each use: registering or removing the app takes effect without a restart.
   const appProviderNow = (): Provider | null => {
@@ -240,41 +253,41 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
   const vault = new Vault(db, box, () => appProviderNow() ?? provider);
   const appDeps = { apiBase: opts.githubApi };
   const routes = compile([...opts.routes, ...githubAppRoutes(config, appDeps)]);
-  const signinLimit = new RateLimiter(60, 10 * 60_000);
-  const writeLimitSession = new RateLimiter(60, 60_000);
-  const writeLimitIp = new RateLimiter(300, 60_000);
+  const signinLimit = new RateLimiter(share(60), 10 * 60_000);
+  const writeLimitSession = new RateLimiter(share(60), 60_000);
+  const writeLimitIp = new RateLimiter(share(300), 60_000);
   const imageIndex = new ImageIndex(db);
   registerImageRepos(async (href) => await imageIndex.reposOf(href));
   const images = opts.images ?? new ImageProxy({
     cacheDir: config.imageCacheDir, repos: async (href) => await imageIndex.reposOf(href),
     token: imageTokenSource(process.env),
   });
-  const imageLimit = new RateLimiter(120, 60_000);    // upstream fetches per session; cache hits are free
-  const imageLimitIp = new RateLimiter(240, 60_000);  // and per client address
+  const imageLimit = new RateLimiter(share(120), 60_000);    // upstream fetches per session; cache hits are free
+  const imageLimitIp = new RateLimiter(share(240), 60_000);  // and per client address
   // GET endpoints that aggregate the mirror or run the embedder: a burst, then 30 a minute, per session.
-  const expensiveGets = new TokenBucket(20, 0.5);
+  const expensiveGets = new TokenBucket(share(20), shareRate(0.5));
   const live = new LiveHub(db, opts.live);
   // The Inbox MCP server (POST /mcp): calls per login and failed authentications per client address, and feedback posts per login as on the dashboard.
-  const mcpLimitToken = new RateLimiter(120, 60_000);
-  const mcpLimitIp = new RateLimiter(300, 60_000);
+  const mcpLimitToken = new RateLimiter(share(120), 60_000);
+  const mcpLimitIp = new RateLimiter(share(300), 60_000);
   // Per helper token, sized for a helper with 16 slots and its fast-lane slot: each idle slot claims every CLAIM_RETRY_S
   // and again at once after a call ends, with retries on errors; status reports come on every change.
-  const remoteClaimLimit = new RateLimiter(600, 60_000);
+  const remoteClaimLimit = new RateLimiter(share(600), 60_000);
   const claimWaits = new ClaimWaits(rdb);
-  const remoteStatusLimit = new RateLimiter(120, 60_000);
+  const remoteStatusLimit = new RateLimiter(share(120), 60_000);
   // Bundle, heartbeat, release and submit of one lease: a heartbeat every 30 seconds and retries.
-  const remoteLeaseLimit = new RateLimiter(120, 60_000);
+  const remoteLeaseLimit = new RateLimiter(share(120), 60_000);
   // Tool calls of one remote call (item, reference and check tools together).
-  const remoteToolLimit = new RateLimiter(300, 60_000);
-  const remoteArchiveLimit = new RateLimiter(20, 60_000); // tarball fetches per lease
+  const remoteToolLimit = new RateLimiter(share(300), 60_000);
+  const remoteArchiveLimit = new RateLimiter(share(20), 60_000); // tarball fetches per lease
   // Task Runner device logins: starts per client address, polls per credential (one every 5 seconds, with slack).
-  const loginStartLimit = new RateLimiter(10, 10 * 60_000);
-  const loginPollLimit = new RateLimiter(30, 60_000);
-  const webhookLimitIp = new RateLimiter(5000, 60_000);  // flood guard only; the periodic sync still runs. Before the body is read or the signature checked
+  const loginStartLimit = new RateLimiter(share(10), 10 * 60_000);
+  const loginPollLimit = new RateLimiter(share(30), 60_000);
+  const webhookLimitIp = new RateLimiter(share(5000), 60_000);  // flood guard only; the periodic sync still runs. Before the body is read or the signature checked
   // Feedback shares the dashboard's limiter, so the two doors together stay within one budget per login.
-  const mcpFeedback = opts.feedbackLimiter ?? new RateLimiter(60, 3600_000);
+  const mcpFeedback = opts.feedbackLimiter ?? new RateLimiter(share(60), 3600_000);
   // list_repos, list_fixups and list_merge_queue aggregate the mirror like the dashboard's expensive GETs: a burst, then 30 a minute, per login.
-  const mcpExpensive = new TokenBucket(20, 0.5);
+  const mcpExpensive = new TokenBucket(share(20), shareRate(0.5));
   const callbackUrl = `${config.baseUrl ?? ""}/auth/callback`;
   let lastPrune = 0;
 
@@ -849,15 +862,15 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
       if (!lease) return gone();
       if (path === ROUTES.tarball) {
         if (!remoteArchiveLimit.allow(String(lease.id))) return tooMany();
-        return await sendArchive(res, lease, url.searchParams.get("repo") ?? "", url.searchParams.get("sha") ?? "");
+        return await sendArchive(res, lease, bearer!, url.searchParams.get("repo") ?? "", url.searchParams.get("sha") ?? "");
       }
       const [, server, name] = tool!;
       if (!TASK_TOOLS[server!] || !lease.servers.includes(server!)) return reply(403, { error: `this call has no ${server} tools` });
       if (!remoteToolLimit.allow(String(lease.id))) return tooMany();
-      const args = await readRemoteJson(req, TOOL_BODY_LIMIT);
+      const args = await readRemoteJson(req, toolBodyLimit(server!));
       const w = waitingJson(res);
       const r = await callTaskTool(db, lease, bearer!, server!, name, args, w.opts);
-      return w.send({ content: [{ type: "text", text: r.text }], ...(r.isError && { isError: true }) } satisfies ToolReply);
+      return w.send({ content: toolContent(r), ...(r.isError && { isError: true }) } satisfies ToolReply);
     } catch (e) {
       if (e instanceof HttpError) return reply(e.status, { error: e.message });
       throw e;
@@ -903,7 +916,7 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
     if (!remoteToolLimit.allow(String(lease.id))) return reply(429, rpcError(-32000, "too many requests; wait a minute"), { "retry-after": "60" });
     let msg: unknown;
     try {
-      msg = await readJson(req, TOOL_BODY_LIMIT);
+      msg = await readJson(req, toolBodyLimit(server));
     } catch (e) {
       if (e instanceof HttpError) return reply(e.status, rpcError(e.status === 400 ? -32700 : -32600, e.message));
       throw e;
@@ -917,8 +930,17 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
   }
 
   /** Streams the tar archive of one tarball mount of the lease's bundle. */
-  async function sendArchive(res: ServerResponse, lease: TaskLease, repo: string, sha: string): Promise<void> {
-    const tar = await archiveOf(lease, repo, sha);
+  async function sendArchive(res: ServerResponse, lease: TaskLease, secret: string, repo: string, sha: string): Promise<void> {
+    const ac = new AbortController();
+    res.on("close", () => { if (!res.writableEnded) ac.abort(); });
+    let tar: Awaited<ReturnType<typeof archiveOf>>;
+    try {
+      tar = await archiveOf(lease, repo, sha, { secret, signal: ac.signal });
+    } catch (e) {
+      if (!(e instanceof LeaseGone)) throw e;
+      res.writeHead(410, secure({ "cache-control": "no-store", "content-type": "application/json; charset=utf-8" }, "default-src 'none'"));
+      return void res.end(JSON.stringify({ error: "the lease is gone (expired, withdrawn or already submitted)" }));
+    }
     if (!tar) {
       res.writeHead(404, secure({ "cache-control": "no-store", "content-type": "application/json; charset=utf-8" }, "default-src 'none'"));
       return void res.end(JSON.stringify({ error: "the call has no such tarball" }));
@@ -1030,7 +1052,7 @@ export async function createApp(opts: AppOptions & { routes: Route[] }) {
 }
 
 export async function startServer(opts: AppOptions): Promise<{ server: Server; url: string; app: Awaited<ReturnType<typeof createApp>>; close(): Promise<void> }> {
-  const feedbackLimiter = opts.feedbackLimiter ?? new RateLimiter(60, 3600_000);
+  const feedbackLimiter = opts.feedbackLimiter ?? new RateLimiter(share(60), 3600_000);
   const app = await createApp({ ...opts, feedbackLimiter, routes: opts.routes ?? (await defaultRoutes(feedbackLimiter, opts.githubUserId)) });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 15_000 }, (req, res) => void app.handle(req, res));
   // Job processes expire user-local leases only while this process stamps that it serves (src/remote/liveness.ts). The

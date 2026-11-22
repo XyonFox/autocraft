@@ -490,7 +490,7 @@ export async function getTaskDetail(db: Db, id: number): Promise<BuildTaskDetail
   if (!t) return null;
   const l = await logTail(db, id);
   const p = await db.get(db.k.selectFrom("build_tasks").select("patch").where("id", "=", id));
-  return { ...t, logTail: l.text, logBytes: l.bytes, logTruncated: l.truncated, patch: p?.patch ?? null };
+  return { ...t, logTail: l.text, logBytes: l.bytes, logTruncated: l.truncated, patch: p?.patch ?? null, canCancel: false };
 }
 
 const CURSOR_RE = /^[1-9][0-9]{0,15}$/;

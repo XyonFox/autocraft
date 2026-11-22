@@ -138,6 +138,12 @@ function RegisterForm({ s }: { s: GithubAppStatus }) {
         <input type="hidden" name="csrf" value={s.csrf} />
         <Input name="name" value={name} onChange={(e) => setName(e.target.value)} maxLength={34} aria-label="App name" className="w-full sm:w-52" />
         <Input name="org" value={org} onChange={(e) => setOrg(e.target.value)} placeholder="Organization (optional)" aria-label="Organization" className="w-full sm:w-52" />
+        {s.keysUnreadable && (
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" name="replace_unreadable" value="1" />
+            Replace the stored keys that cannot be read
+          </label>
+        )}
         <Button type="submit" variant="primary" disabled={!s.canRegister || !name.trim()} className="max-md:h-11 max-md:w-full">
           Register on GitHub
         </Button>

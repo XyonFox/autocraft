@@ -49,6 +49,7 @@ import { CIFIX_PUSH_STATES, CIFIX_TRY_STATES, MAX_FAILURES, labelWithScopeAnswer
 import type { AssignFacts, PassFacts, PrFacts, PrTier } from "./plan.ts";
 import { settledByExpr } from "../settlers.ts";
 import { activeTrips, brokeHeads } from "../push-outcomes.ts";
+import { tripsOfRepo } from "./push-outcome.ts";
 import { setting } from "../settings-read.ts";
 import { allOf, everySeq, someSeq } from "../async-seq.ts";
 import type { Db } from "../db/index.ts";
@@ -343,7 +344,7 @@ export async function loadPrFacts(db: Db, opts: LoadOptions = {}): Promise<PrFac
     const pushedOff = r.state === "OPEN" && !integration && !!head && (pushedOffAt.get(`${ref}@${head}`) ?? []).some((p) => !r.updated_at || Date.parse(r.updated_at) < Date.parse(p.at));
     const lines = (r.additions ?? 0) + (r.deletions ?? 0);
     const base: PrFacts = {
-      repo: r.repo, number: r.number, ...(pushedOff ? { pushedOff } : {}), assignment: assigned(ref, r.assignees), now, pipelineOn, tripped, ghState: r.state, head, draft: fresh ? r.c_state !== "OPEN" || !!r.c_draft : !!r.is_draft,
+      repo: r.repo, number: r.number, ...(pushedOff ? { pushedOff } : {}), assignment: assigned(ref, r.assignees), now, pipelineOn, tripped: tripsOfRepo(tripped, r.repo), ghState: r.state, head, draft: fresh ? r.c_state !== "OPEN" || !!r.c_draft : !!r.is_draft,
       author: r.author, authorIsPipeline: r.author !== null && await own.isOwn(r.repo, r.author), tier: "not", lines, size: sizeOf(lines), label: null, needsDecisionFlag: false,
       scopeAnswer: scope.get(ref) ?? null,
       inScope, ...(outsideHolds.has(ref) ? { outsideHold: outsideHolds.get(ref)! } : {}), integration, batchPr: !!r.batch_pr, heldBacklog: !!r.held_backlog, heldDuplicate: !r.held_backlog && !!r.held_dup, quiet: own.quiet.has(ref), mergeHeld: holds.has(ref),

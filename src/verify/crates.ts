@@ -23,7 +23,7 @@ export async function ghApi(path: string, jq?: string): Promise<string> {
   const args = ["api", path, ...(jq ? ["--jq", jq] : [])];
   const env = await readEnvFor("gh", args);
   return new Promise((resolve, reject) => {
-    const p = spawn("gh", args, { cwd: REPO_DIR, timeout: 60_000, ...(env ? { env } : {}) });
+    const p = spawn("gh", args, { cwd: REPO_DIR, timeout: 60_000, windowsHide: true, ...(env ? { env } : {}) });
     const out: Buffer[] = [];
     let err = "";
     p.stdout.on("data", (d: Buffer) => out.push(d));

@@ -32,11 +32,11 @@ test("a new branch takes the CI result of its base commit, not the latest main C
   await ci("base", "red", "2026-11-01T00:00:00Z");
   await ci("latest", "green", "2026-11-02T00:00:00Z");
   const before = async () => (await db.get(db.k.selectFrom("push_outcomes").select("before_res").orderBy("id", "desc").limit(1)))!.before_res;
-  await recordPush(db, "fixissue-push", { repo: "o/r", number: null, from: null, to: "c1", base: "base" });
+  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c1", base: "base" });
   assert.equal(await before(), "red");
-  await recordPush(db, "fixissue-push", { repo: "o/r", number: null, from: null, to: "c2", base: "gone" });
+  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c2", base: "gone" });
   assert.equal(await before(), "green", "no row for the base: the latest main CI");
-  await recordPush(db, "fixissue-push", { repo: "o/r", number: null, from: null, to: "c3" });
+  await recordPush(db, "implement-push", { repo: "o/r", number: null, from: null, to: "c3" });
   assert.equal(await before(), "green");
   const rows = [{ repo: "o/r", number: 5, head_oid: "c1", checks: [{ name: "gate", state: "failure" }] }];
   await resolvePushes(db, rows);

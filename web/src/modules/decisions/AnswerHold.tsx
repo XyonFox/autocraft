@@ -55,7 +55,7 @@ export function AnswerHold({ d }: { d: Decision }) {
       <div className="space-y-2 text-sm">
         <p className="text-ink/85">{chose}.</p>
         <p className="text-xs text-ink/55">{d.answeredBy} can no longer settle this, so the answer is not applied.</p>
-        {operator && settler && (
+        {settler && (
           <Button size="md" icon={ArrowUUpLeftIcon} loading={write.busy === "undo"} onClick={() => void write.run("undo", () => api.decisions.undo(d.id))} className="max-md:h-11">Reassign</Button>
         )}
         <ErrorLine error={write.error} className="text-xs" />

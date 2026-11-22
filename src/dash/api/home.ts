@@ -86,7 +86,7 @@ async function needs(db: Db, req: Req, hidden: HiddenRepos, staff: boolean, page
 
 async function problems(db: Db, hidden: string[], staff: boolean, stops: NeedsStoppedRow[]): Promise<HomeProblem[]> {
   const out: HomeProblem[] = [];
-  for (const s of stops) out.push({ kind: "stopped", title: s.title, detail: staff ? s.reason : "", to: "/needs/stopped" });
+  for (const s of stops) out.push({ kind: "stopped", title: s.repo ? `${s.title} in ${s.repo}` : s.title, detail: staff ? s.reason : "", to: "/needs/stopped" });
   const seen = new Set(stops.map((s) => s.id));
   // The health list repeats breakers, limits and paused accounts; those are the stopped rows above.
   const fhide = excludeHiddenExpr(db, "repo", hidden);

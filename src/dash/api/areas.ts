@@ -1,5 +1,5 @@
 // Area lists of a repo over JSON. Everyone who may see the repo reads the list, the counts and the open
-// proposals; only operators edit the list, accept or dismiss proposals and start the model steps.
+// proposals; operators and maintainers with write edit the list, accept or dismiss proposals and start the model steps.
 import type { AreaEditBody, RepoAreas } from "../../../web/src/api/types.ts";
 import { AreaError, acceptProposal, areaCounts, currentList, decideSuggestion, dismissProposal, editAreas, listVersions, proposalsOf, unassignedCount, type AreaEdit } from "../../areas/store.ts";
 import { enqueue, JobError } from "../../runner/jobs.ts";
@@ -8,6 +8,7 @@ import { HttpError } from "../server/util.ts";
 import type { Req } from "../types.ts";
 import { needVisible } from "./visible.ts";
 import type { Db } from "../../db/index.ts";
+import { mayRunRepo } from "../repo-access.ts";
 
 const wrap = async <T>(f: () => Promise<T | Promise<T>>): Promise<T> => {
   try {
@@ -45,8 +46,8 @@ export async function repoAreas(db: Db, req: Req): Promise<RepoAreas> {
   };
 }
 
-function operatorOf(req: Req): string {
-  if (req.user.role !== "operator") throw new HttpError(403, "only operators change area lists");
+async function runnerOf(req: Req, repo: string): Promise<string> {
+  if (!(await mayRunRepo(req.user, repo))) throw new HttpError(403, "no write access to this repo");
   return req.user.login;
 }
 
@@ -56,8 +57,9 @@ async function rescan(db: Db, repo: string, by: string): Promise<void> {
 }
 
 export async function edit(db: Db, req: Req): Promise<RepoAreas> {
-  const by = operatorOf(req), repo = req.params.repo!;
+  const repo = req.params.repo!;
   await needVisible(db, req, repo);
+  const by = await runnerOf(req, repo);
   const b = body(req) as AreaEditBody & Record<string, unknown>;
   const op = str(b.op, "op");
   let e: AreaEdit;
@@ -77,10 +79,11 @@ export async function edit(db: Db, req: Req): Promise<RepoAreas> {
 }
 
 export async function acceptProposalApi(db: Db, req: Req): Promise<RepoAreas> {
-  const by = operatorOf(req), id = Number(req.params.id);
+  const id = Number(req.params.id);
   const repo = (await db.get(db.k.selectFrom("area_proposals").select("repo").where("id", "=", id)))?.repo;
   if (!repo) throw new HttpError(404, "no such proposal");
   await needVisible(db, req, repo);
+  const by = await runnerOf(req, repo);
   const b = req.json && typeof req.json === "object" && !Array.isArray(req.json) ? (req.json as Record<string, unknown>) : {};
   const kind = (await db.get(db.k.selectFrom("area_proposals").select("kind").where("id", "=", id)))!.kind;
   const version = await wrap(async () => kind === "suggest"
@@ -92,10 +95,11 @@ export async function acceptProposalApi(db: Db, req: Req): Promise<RepoAreas> {
 }
 
 export async function dismiss(db: Db, req: Req): Promise<{ ok: true }> {
-  const by = operatorOf(req), id = Number(req.params.id);
+  const id = Number(req.params.id);
   const repo = (await db.get(db.k.selectFrom("area_proposals").select("repo").where("id", "=", id)))?.repo;
   if (!repo) throw new HttpError(404, "no such proposal");
   await needVisible(db, req, repo);
+  const by = await runnerOf(req, repo);
   await wrap(async () => await dismissProposal(db, id, by));
   return { ok: true };
 }
@@ -104,8 +108,9 @@ const STEP = { propose: "areas-propose", suggest: "areas-suggest", rescan: "area
 
 /** Queues one of the area steps for the repo. */
 export async function run(db: Db, req: Req): Promise<{ jobId: number }> {
-  const by = operatorOf(req), repo = req.params.repo!;
+  const repo = req.params.repo!;
   await needVisible(db, req, repo);
+  const by = await runnerOf(req, repo);
   const what = str(body(req).step, "step");
   if (!(what in STEP)) throw new HttpError(400, "step must be propose, suggest or rescan");
   if (what !== "propose" && !await currentList(db, repo)) throw new HttpError(409, `${repo} has no area list yet`);

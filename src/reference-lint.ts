@@ -4,10 +4,13 @@
 // Both only run for a repo that has a reference folder.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { isHalt } from "./agents/call.ts";
+import { isHalt, NoTakerError, WaitLimitError } from "./agents/call.ts";
 import { jevAvailable } from "./agents/jev.ts";
 import { runModelStep } from "./agents/step.ts";
-import { inferenceMode } from "./remote/mode.ts";
+import { inferenceMode, tierOfModel } from "./remote/mode.ts";
+import { ownTaker } from "./remote/takers.ts";
+import { scaled } from "./remote/time-scale.ts";
+import { CLAUDE_PROMPTS } from "./prompts/index.ts";
 import { REFERENCE_HAIKU, REFERENCE_JEV } from "./agents/steps.ts";
 import { QUOTE_WORDS, REFERENCE_JEV_ACCEPT, REFERENCE_JEV_REJECT, type LintProblem } from "./replylint.ts";
 import { REFERENCE_LEAK } from "./review/opus-parse.ts";
@@ -161,14 +164,29 @@ export const HAIKU_WAIT_MS = 30_000;
  * check lets the text out unchecked, which costs more than a fix turn on a cold cache.
  */
 export const HAIKU_WAIT_REMOTE_MS = 10 * 60_000;
+/** The same for a check bound to a maintainer: their own lane takes it at once, so a longer wait means none will. */
+export const HAIKU_WAIT_OWN_MS = scaled(60_000);
 
-export function defaultSemanticDeps(db: Db, ref: string): SemanticDeps {
+/** `forLogin`: the Haiku check runs only on that user's own Task Runners (a maintainer's conversation turn). */
+export function defaultSemanticDeps(db: Db, ref: string, o: { forLogin?: string } = {}): SemanticDeps {
   return {
     async jev(text) {
       const r = await runModelStep(db, REFERENCE_JEV, { ref, text });
       return r.ok ? r.value : null;
     },
     async haiku(text) {
+      if (o.forLogin !== undefined) {
+        // A maintainer's check runs on their own Task Runner: one without a small-tier model, or none that takes it in time, counts as no answer.
+        const id = "lint.reference.haiku", repo = ref.split("#")[0]!;
+        if (!await ownTaker(db, o.forLogin, { prompt_id: id, repos: [repo], tier: tierOfModel(CLAUDE_PROMPTS[id].models[0]!) })) return null;
+        try {
+          const r = await runModelStep(db, REFERENCE_HAIKU, [{ ref, text }], { maxWaitMs: HAIKU_WAIT_OWN_MS, forLogin: o.forLogin });
+          return r.ok ? r.value : null;
+        } catch (e) {
+          if (e instanceof NoTakerError || e instanceof WaitLimitError) return null;
+          throw e;
+        }
+      }
       const r = await runModelStep(db, REFERENCE_HAIKU, [{ ref, text }], { maxWaitMs: await inferenceMode(db) === "user-local" ? HAIKU_WAIT_REMOTE_MS : HAIKU_WAIT_MS });
       return r.ok ? r.value : null;
     },

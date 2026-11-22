@@ -22,12 +22,12 @@ import { Segmented } from "../../ui/molecules/Segmented";
 const usd = (v: number) => formatCost(v) ?? "$0.00";
 
 /** The spend-cap form of starting and continuing a scan. */
-function CapDialog({ title, submit, initial, above, open, onClose, send }: { title: string; submit: string; initial: number; above: number; open: boolean; onClose: () => void; send: (cap: number | null) => Promise<unknown> }) {
+function CapDialog({ title, submit, initial, above, uncapped, open, onClose, send }: { title: string; submit: string; initial: number; above: number; uncapped: boolean; open: boolean; onClose: () => void; send: (cap: number | null) => Promise<unknown> }) {
   const write = useWrite();
   const [mode, setMode] = useState<"amount" | "none">("amount");
   const [amount, setAmount] = useState(String(initial));
   const cap = mode === "none" ? null : Number(amount);
-  const valid = cap === null || (Number.isFinite(cap) && cap > above);
+  const valid = cap === null ? uncapped : Number.isFinite(cap) && cap > above;
   return (
     <Dialog open={open} onClose={onClose} title={title}>
       <form
@@ -39,7 +39,7 @@ function CapDialog({ title, submit, initial, above, open, onClose, send }: { tit
       >
         <div className="flex flex-col gap-2">
           <span className="text-sm font-medium" id="cap-label">Spend cap</span>
-          <Segmented label="Spend cap" value={mode} onChange={setMode} options={[{ value: "amount", label: "Amount" }, { value: "none", label: "No cap" }]} />
+          {uncapped && <Segmented label="Spend cap" value={mode} onChange={setMode} options={[{ value: "amount", label: "Amount" }, { value: "none", label: "No cap" }]} />}
           {mode === "amount" && (
             <label className="flex items-center gap-2 text-sm">
               <span className="text-ink/60">$</span>
@@ -59,20 +59,21 @@ function CapDialog({ title, submit, initial, above, open, onClose, send }: { tit
 
 function StartDialog({ repo, open, onClose }: { repo: string; open: boolean; onClose: () => void }) {
   const api = useApi();
-  return <CapDialog title="Deep scan" submit="Start scan" initial={20} above={0} open={open} onClose={onClose} send={(cap) => api.security.startScan(repo, cap)} />;
+  const uncapped = useUser().role === "operator";
+  return <CapDialog title="Deep scan" submit="Start scan" initial={20} above={0} uncapped={uncapped} open={open} onClose={onClose} send={(cap) => api.security.startScan(repo, cap)} />;
 }
 
 /** Continue a scan that stopped at its cap: prefilled with the estimate of the whole scan, rounded up. */
-function ContinueDialog({ s, open, onClose }: { s: ScanView; open: boolean; onClose: () => void }) {
+function ContinueDialog({ s, open, onClose }: { s: ScanView; max?: number; open: boolean; onClose: () => void }) {
   const api = useApi();
+  const uncapped = useUser().role === "operator";
   const initial = Math.ceil(Math.max(s.estimateUsd ?? 0, s.costUsd + 1));
-  return <CapDialog title="Continue scan" submit="Continue scan" initial={initial} above={s.costUsd} open={open} onClose={onClose} send={(cap) => api.security.continueScan(s.id, cap)} />;
+  return <CapDialog title="Continue scan" submit="Continue scan" initial={initial} above={s.costUsd} uncapped={uncapped} open={open} onClose={onClose} send={(cap) => api.security.continueScan(s.id, cap)} />;
 }
 
 export function ScanRow({ s, link }: { s: ScanView; link?: boolean }) {
   const api = useApi();
   const write = useWrite();
-  const operator = useUser().role === "operator";
   const [resume, setResume] = useState(false);
   const active = scanActive(s.state);
   const st = SCAN_STATE[s.state];
@@ -84,12 +85,12 @@ export function ScanRow({ s, link }: { s: ScanView; link?: boolean }) {
         {link && <Link to={scanPath(s.id)} className="num text-sm text-accent-ink hover:underline max-md:flex max-md:min-h-11 max-md:items-center">Scan {s.id}</Link>}
         <span className="num text-sm">{s.areasTotal ? `${s.areasDone} of ${s.areasTotal} areas` : "No areas yet"}</span>
         {s.areasTotal > 0 && <RateBar frac={frac} className="w-24 max-md:flex-1" />}
-        {active && (
+        {active && s.canAct && (
           <Button size="md" icon={StopIcon} loading={write.busy === "stop"} onClick={() => void write.run("stop", () => api.security.stopScan(s.id))} className="ml-auto max-md:h-11">
             Stop
           </Button>
         )}
-        {operator && s.state === "capped" && (
+        {s.canContinue && s.state === "capped" && (
           <>
             <Button size="md" icon={PlayIcon} onClick={() => setResume(true)} className="ml-auto max-md:h-11">Continue</Button>
             <ContinueDialog key={s.costUsd} s={s} open={resume} onClose={() => setResume(false)} />
@@ -132,7 +133,6 @@ function FindingRow({ f }: { f: FindingSummary }) {
 
 /** Deep scan: the start button, the latest scan and the findings. Rendered for operators and maintainers only. */
 export function SecuritySection({ repo }: { repo: string }) {
-  const operator = useUser().role === "operator";
   const [open, setOpen] = useState(false);
   const { data, error } = useQuery(`security:${repo}`, (a) => a.security.overview(repo));
   const scan = data?.scans[0];
@@ -147,7 +147,7 @@ export function SecuritySection({ repo }: { repo: string }) {
           <Link to={`${scanPath()}?repo=${encodeURIComponent(repo)}`} className="inline-flex min-h-8 items-center gap-1 rounded text-sm text-accent-ink hover:underline max-md:min-h-11">
             <ListMagnifyingGlassIcon /> All scans
           </Link>
-          {operator && (
+          {data?.canStart && (
             <Button icon={ShieldWarningIcon} disabled={running} onClick={() => setOpen(true)} className="max-md:h-11">
               Deep scan
             </Button>
@@ -155,7 +155,7 @@ export function SecuritySection({ repo }: { repo: string }) {
         </div>
       )}
     >
-      {operator && <StartDialog repo={repo} open={open} onClose={() => setOpen(false)} />}
+      {data?.canStart && <StartDialog repo={repo} open={open} onClose={() => setOpen(false)} />}
       <ErrorLine error={error?.message} className="px-4 py-3" />
       {scan && <ScanRow s={scan} link />}
       {data && data.findings.length > 0 ? (

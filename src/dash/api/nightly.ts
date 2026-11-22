@@ -1,5 +1,6 @@
 // The Nightly page: per repo, the catalogue's checks with their last 14 nights and the benchmark series. Repos the
-// viewer cannot see are left out (a bench or selection request for one is a 404). Only operators change a selection.
+// viewer cannot see are left out (a bench or selection request for one is a 404). Operators and maintainers with write access to the repo change a selection.
+import { mayRunRepo } from "../repo-access.ts";
 import type { NightlyBench, NightlyCell, NightlyCheckRow, NightlyGrid, NightlyRepo, NightlySeries } from "../../../web/src/api/types.ts";
 import { featureOn } from "../../build/features.ts";
 import { audit } from "../audit.ts";
@@ -35,7 +36,7 @@ async function benchesOf(db: Db, repo: string): Promise<NightlyBench[]> {
   });
 }
 
-async function repoOf(db: Db, repo: string): Promise<NightlyRepo> {
+async function repoOf(db: Db, repo: string, canSelect: boolean): Promise<NightlyRepo> {
   const runs = await recentRuns(db, repo, NIGHTS);
   const sel = await selectionOf(db, repo);
   const checks = NIGHTLY_CHECKS.map((c): NightlyCheckRow => {
@@ -46,7 +47,7 @@ async function repoOf(db: Db, repo: string): Promise<NightlyRepo> {
     });
     return { id: c.id, label: c.label, enabled: s?.enabled ?? false, experimental: !!c.experimental, needs: c.needs ?? null, takes: takesOf(c.id), crates: s?.crates ?? [], targets: s?.targets ?? [], cells };
   });
-  return { repo, on: await featureOn(db, "nightly", repo), nights: runs.map((u) => ({ runId: u.id, startedAt: u.startedAt, sha: u.sha })), checks, benches: await benchesOf(db, repo) };
+  return { repo, canSelect, on: await featureOn(db, "nightly", repo), nights: runs.map((u) => ({ runId: u.id, startedAt: u.startedAt, sha: u.sha })), checks, benches: await benchesOf(db, repo) };
 }
 
 /** Repos with the switch on, any selection row or any run. */
@@ -55,7 +56,7 @@ const shown = async (db: Db, repo: string): Promise<boolean> =>
     .unionAll(db.k.selectFrom("nightly_runs").select((eb) => eb.lit(1).as("one")).where("repo", "=", repo)).limit(1));
 
 export const grid = async (db: Db, req: Req): Promise<NightlyGrid> =>
-  ({ repos: await mapSeq((await filterSeq((await visibleRepos(db, req)), async (r) => await shown(db, r))), async (r) => await repoOf(db, r)) });
+  ({ repos: await mapSeq((await filterSeq((await visibleRepos(db, req)), async (r) => await shown(db, r))), async (r) => await repoOf(db, r, await mayRunRepo(req.user, r))) });
 
 async function visible(db: Db, req: Req, repo: unknown): Promise<string> {
   if (typeof repo !== "string" || !(await visibleRepos(db, req)).includes(repo)) throw new HttpError(404, "no such repo");
@@ -78,6 +79,7 @@ function names(v: unknown, what: string): string[] | undefined {
 export const select = async (db: Db, req: Req): Promise<NightlyGrid> => {
   const b = (req.json ?? {}) as { repo?: unknown; check?: unknown; enabled?: unknown; crates?: unknown; targets?: unknown };
   const repo = await visible(db, req, b.repo);
+  if (!await mayRunRepo(req.user, repo)) throw new HttpError(403, "only an operator, or a maintainer with write access to the repo, selects its nightly checks");
   if (typeof b.check !== "string" || !checkOf(b.check)) throw new HttpError(400, `check must be one of ${NIGHTLY_CHECKS.map((c) => c.id).join(", ")}`);
   if (typeof b.enabled !== "boolean") throw new HttpError(400, "enabled must be true or false");
   const crates = names(b.crates, "crates");

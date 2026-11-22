@@ -141,9 +141,9 @@ export const WRITES: WriteKind[] = [
   },
   {
     field: "fixing",
-    name: "Fix issues",
-    short: "Fix",
-    line: "Pushes issue fixes to the pipeline fork and opens pull requests and comments",
+    name: "Issue implementations",
+    short: "Implement",
+    line: "Implements queued issues: pushes to the pipeline fork, opens pull requests and comments on issues",
     run: (a, n, on) => a.repoAdmin.approveFixing(n, on),
   },
   {
@@ -222,13 +222,12 @@ export function PipelineBadge({ r }: { r: TrackedRepo }) {
   return r.pipeline ? <Badge tone="ok">On</Badge> : <Badge>Off</Badge>;
 }
 
-/** The repo's pipeline switch for operators; others see the state. */
+/** The repo's pipeline switch for whoever may switch it (operators, maintainers with write access); others see the state. */
 export function PipelineSwitch({ r, write }: { r: TrackedRepo; write: Write }) {
   const api = useApi();
-  const operator = useUser().role === "operator";
   const key = `pipeline:${r.name}`;
   if (!r.tracked) return null;
-  if (!operator) return <PipelineBadge r={r} />;
+  if (!r.canSwitch) return <PipelineBadge r={r} />;
   return <Switch on={r.pipeline} label={`Pipeline in ${r.name}`} onChange={(on) => void write.run(key, () => api.repoAdmin.setPipeline(r.name, on), { repo: r.name, patch: () => ({ pipeline: on }) })} />;
 }
 
@@ -236,10 +235,10 @@ export const synced = (r: TrackedRepo) =>
   r.syncedAt ? `${eventTime(r.syncedAt)}` : "never";
 export const maybe = (n: number | null) => (n === null ? "–" : num(n));
 
-/** The checks whose failure does not stop a merge: a list for everyone, with remove and add for operators. */
+/** The checks whose failure does not stop a merge: a list for everyone, with remove and add for whoever may manage the repo. */
 export function OptionalChecks({ r, write }: { r: TrackedRepo; write: Write }) {
   const api = useApi();
-  const operator = useUser().role === "operator";
+  const operator = r.canManage;
   const [pick, setPick] = useState("");
   const offered = r.seenChecks.filter((c) => !r.optionalChecks.includes(c));
   const choice = offered.includes(pick) ? pick : offered[0] ?? "";

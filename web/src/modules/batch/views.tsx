@@ -10,6 +10,7 @@ import type { BatchCi, BatchDetail, BatchEvent, BatchEventKind, BatchMemberDetai
 import { batchPath, repoSlug } from "../../lib/links";
 import type { ViewProps } from "../../registry/types";
 import { useUser } from "../../shell/UserContext";
+import { canRun } from "../../registry/permissions";
 import { Badge, type Tone } from "../../ui/atoms/Badge";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { ItemRef } from "../../ui/molecules/ItemRef";
@@ -113,7 +114,7 @@ function Ci({ b }: { b: BatchDetail }) {
 function StopBatch({ b }: { b: BatchDetail }) {
   const api = useApi();
   const write = useWrite();
-  if (useUser().role !== "operator" || !active(b)) return null;
+  if (!canRun(useUser(), b.repo) || !active(b)) return null;
   return (
     <span className="mt-3 flex items-center justify-end gap-2">
       <ErrorLine error={write.error} className="text-2xs" />
@@ -125,11 +126,11 @@ function StopBatch({ b }: { b: BatchDetail }) {
 const menuCls = "z-50 min-w-[200px] rounded-md border border-line-strong bg-raised p-1 shadow-[0_12px_32px_rgba(0,0,0,0.28)] animate-rise";
 const itemCls = "flex h-8 cursor-default items-center gap-2.5 rounded px-2 text-sm outline-none data-[highlighted]:bg-ink/[0.07] max-md:h-11";
 
-/** The row's overflow menu; operators only, and only while the batch is in flight. */
+/** The row's overflow menu; whoever runs the repo, and only while the batch is in flight. */
 function RowActions({ b, m }: { b: BatchDetail; m: BatchMemberDetail }) {
   const api = useApi();
   const write = useWrite();
-  if (useUser().role !== "operator" || m.state !== "in" || !active(b)) return null;
+  if (!canRun(useUser(), m.repo) || m.state !== "in" || !active(b)) return null;
   const ref = `${m.repo}#${m.number}`;
   return (
     <span className="relative z-10 inline-flex flex-col items-end">

@@ -30,7 +30,7 @@ const STEPS: NextStep[] = ([
     items: [item(a!, 431, "fixup", "Review asked for 2 fixes", { bucket: "fix", rank: 96, fast: true })],
   },
   {
-    lane: "cifix", title: "Fix failing CI", stage: "Fix", steps: ["cifix"], canRun: false, kind: "breaker", why: "3 pushes refused in a row; an operator resumes it", note: null,
+    lane: "cifix", title: "Fix failing CI", stage: "Fix", steps: ["cifix"], canRun: false, kind: "breaker", why: "3 of the last 10 cifix pushes broke a required check, in 2 repos (deckcraft, designcraft); an operator resumes it", note: null,
     items: [item(b!, 98, "cifix", "CI failed on the formatting check", { bucket: "work" })],
   },
   {

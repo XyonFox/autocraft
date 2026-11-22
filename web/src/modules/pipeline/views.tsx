@@ -7,7 +7,6 @@ import { ArrowLeftIcon } from "@phosphor-icons/react";
 import { useApi, useQuery } from "../../api/client";
 import type { Job, JobItem, JobParams, JobState, PipelineOverview, SyncRun } from "../../api/types";
 import type { ViewProps } from "../../registry/types";
-import { can } from "../../registry/permissions";
 import { Badge, type Tone } from "../../ui/atoms/Badge";
 import { Button } from "../../ui/atoms/Button";
 import { cn } from "../../ui/cn";
@@ -247,13 +246,13 @@ function JobItems({ items }: { items: JobItem[] }) {
   );
 }
 
-export function JobPanel({ params, user }: ViewProps) {
+export function JobPanel({ params }: ViewProps) {
   const id = params.id ? Number(params.id) : null;
   if (!id) return <div className="grid h-full place-items-center p-6 text-sm text-ink/50">Pick a job to see its progress and log.</div>;
-  return <JobDetailView key={id} id={id} operator={can(user, "operator")} />;
+  return <JobDetailView key={id} id={id} />;
 }
 
-function JobDetailView({ id, operator, back }: { id: number; operator: boolean; back?: boolean }) {
+function JobDetailView({ id, back }: { id: number; back?: boolean }) {
   const api = useApi();
   // The log tail is read from a file the job writes, which raises no change event: poll while the job runs.
   const q = useQuery(`pipeline-job:${id}`, (a) => a.pipeline.job(id), { pollMs: (d) => (!d || d.state === "queued" || d.state === "running" ? 2000 : false) });
@@ -277,7 +276,7 @@ function JobDetailView({ id, operator, back }: { id: number; operator: boolean; 
           <h2 className="text-base font-semibold">Job #{id}</h2>
           {j && <span className="code text-sm text-ink/70">{j.step}</span>}
           {j && <JobBadge j={j} />}
-          {j && operator && (j.state === "queued" || j.state === "running") && !j.cancelRequested && (
+          {j && j.canCancel && (j.state === "queued" || j.state === "running") && !j.cancelRequested && (
             <ConfirmButton className="ml-auto" label={j.state === "queued" ? "Cancel" : "Stop"} confirmLabel={j.state === "queued" ? "Cancel this job" : "Stop this job"} loading={write.busy === "cancel"} onConfirm={() => void write.run("cancel", () => api.pipeline.cancel(id))} />
           )}
         </div>
@@ -326,7 +325,7 @@ function JobDetailView({ id, operator, back }: { id: number; operator: boolean; 
 }
 
 export function PhonePipeline(props: ViewProps) {
-  if (props.params.id) return <JobDetailView id={Number(props.params.id)} operator={can(props.user, "operator")} back />;
+  if (props.params.id) return <JobDetailView id={Number(props.params.id)} back />;
   return <PipelineView {...props} />;
 }
 

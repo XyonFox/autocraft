@@ -188,7 +188,7 @@ A StatefulSet pod holds the ReadWriteOnce claims, so nothing else can mount them
 
 ## VPS with Docker Compose
 
-`deploy/compose/compose.yaml` runs the dashboard, the runner and the `periodic` container (sync every minute, `backup daily 7` daily, the loop of the Kubernetes manifest) on one host. Copy `deploy/compose/container.env.example` to `container.env` next to it (mode 0600) and fill it in. `GH_TOKEN` and the settings of the table in the introduction go there; the file is read by all three services. `AUTOCRAFT_IMAGE` (shell or `.env`) names the image; the default is the local `autocraft`.
+`deploy/compose/compose.yaml` runs the dashboard, the runner and the `periodic` container (`autocraft-server periodic`: sync every minute and `backup daily 7` daily, from `deploy/periodic.sh`) on one host. Copy `deploy/compose/container.env.example` to `container.env` next to it (mode 0600) and fill it in. `GH_TOKEN` and the settings of the table in the introduction go there; the file is read by all three services. `AUTOCRAFT_IMAGE` (shell or `.env`) names the image; the default is the local `autocraft`.
 
 | Item | Value |
 |---|---|

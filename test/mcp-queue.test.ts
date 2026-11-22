@@ -37,22 +37,22 @@ const weights = async (w: World) => (await fastTrackList(w.db)).map((f) => [f.nu
 const data = (text: string): any => JSON.parse(text.slice(text.indexOf(">>>\n") + 4, text.lastIndexOf("\n<<<end untrusted>>>")));
 
 describe("merge queue tools", () => {
-  test("an operator is offered the write tools; a maintainer's answering token only queue_pr; everyone reads the queue", async () => {
+  test("an operator is offered the write tools; a maintainer's token also steers the queue where they write, without weights on queue_pr; everyone reads the queue", async () => {
     const w = await fresh();
     const op = envOf(w, "operator"), maint = envOf(w, "maintainer"), viewer = envOf(w, "viewer");
     const maintNoAnswer = envOf(w, "maintainer", "maint", { role: "maintainer" }, false);
     const writes = (list: string[]) => list.filter((n) => ["queue_pr", "set_weight", "cancel_queued"].includes(n));
     for (const n of ["queue_pr", "set_weight", "cancel_queued", "list_merge_queue"]) assert.ok((await names(op)).includes(n), n);
     for (const env of [maint, maintNoAnswer, viewer]) assert.ok((await names(env)).includes("list_merge_queue"));
-    assert.deepEqual(writes(await names(maint)), ["queue_pr"]);
+    assert.deepEqual(writes(await names(maint)), ["set_weight", "queue_pr", "cancel_queued"]);
     // Weights are set by operators: a maintainer's queue_pr takes none.
     assert.equal((await rpc(maint, "tools/list")).tools.find((t: { name: string }) => t.name === "queue_pr").inputSchema.properties.weight, undefined);
-    assert.deepEqual(writes(await names(maintNoAnswer)), []);
+    assert.deepEqual(writes(await names(maintNoAnswer)), ["set_weight"]);
     assert.deepEqual(writes(await names(viewer)), []);
     assert.match((await rpc(op, "initialize", { protocolVersion: "2025-06-18" })).instructions, /queue_pr/);
     const maintText = (await rpc(maint, "initialize", { protocolVersion: "2025-06-18" })).instructions;
     assert.match(maintText, /queue_pr/);
-    assert.doesNotMatch(maintText, /set_weight|cancel_queued/);
+    assert.match(maintText, /set_weight/);
     assert.doesNotMatch((await rpc(maintNoAnswer, "initialize", { protocolVersion: "2025-06-18" })).instructions, /queue_pr/);
   });
 
@@ -100,11 +100,11 @@ describe("merge queue tools", () => {
     }
   });
 
-  test("a maintainer queues only where they answer decisions, with the default weight; set_weight and cancel_queued stay with operators", async () => {
+  test("a maintainer queues only where they answer decisions, with the default weight; set_weight and cancel_queued need write on the repo", async () => {
     const w = await (await (await fresh()).pr(1)).pr(2);
     const maint = envOf(w, "maintainer");
     const refusedAll = async () => {
-      for (const [name, args, why] of [["queue_pr", { item: "app#1" }, /only an operator, or a maintainer with write access where the app acts for them/], ["set_weight", { item: "app#1", weight: 9 }, /only operators steer the merge queue/], ["cancel_queued", { item: "app#1" }, /only operators steer the merge queue/]] as const) {
+      for (const [name, args, why] of [["queue_pr", { item: "app#1" }, /only an operator, or a maintainer with write access where the app acts for them/]] as const) {
         const r = await call(maint, name, args);
         assert.equal(r.isError, true, name);
         assert.match(r.text, why, name);
@@ -126,8 +126,9 @@ describe("merge queue tools", () => {
     await addFastTrack(w.db, OPERATOR, "app#2", 3);
     assert.equal((await call(maint, "queue_pr", { item: "app#2", weight: 9 })).isError, false);
     assert.deepEqual(await weights(w), [[1, 5], [2, 3]]);
-    assert.equal((await call(maint, "cancel_queued", { item: "app#1" })).isError, true);
-    assert.equal((await call(maint, "set_weight", { item: "app#1", remove: true })).isError, true);
+    // Weights and withdrawing a queued merge are steering, open to a maintainer with write on the repo.
+    assert.equal((await call(maint, "set_weight", { item: "app#2", weight: 9 })).isError, false);
+    assert.equal((await call(maint, "cancel_queued", { item: "app#1" })).isError, false);
   });
 
   test("an operator demoted after tools/list is refused on the next call, with the tools still in its client's list", async () => {
@@ -138,7 +139,7 @@ describe("merge queue tools", () => {
     assert.equal((await call(env, "queue_pr", { item: "app#2", weight: 4 })).isError, false);
     who.role = "maintainer";
     // A maintainer queues only where they answer decisions (maintainer writes are off here).
-    for (const [name, args, why] of [["queue_pr", { item: "app#1" }, /only an operator, or a maintainer/], ["set_weight", { item: "app#2", weight: 9 }, /only operators steer the merge queue; op is a maintainer/], ["cancel_queued", { item: "app#2" }, /only operators steer the merge queue; op is a maintainer/]] as const) {
+    for (const [name, args, why] of [["queue_pr", { item: "app#1" }, /only an operator, or a maintainer/]] as const) {
       const r = await call(env, name, args);
       assert.equal(r.isError, true, name);
       assert.match(r.text, why, name);
@@ -146,8 +147,8 @@ describe("merge queue tools", () => {
     assert.equal(await preapprovalOf(w.db, "app", 1), null);
     assert.equal((await preapprovalOf(w.db, "app", 2))?.state, "review");
     assert.deepEqual(await weights(w), [[2, 4]]);
-    // As a maintainer with an answering token it keeps only queue_pr (the server turns answering off while maintainer writes are off).
-    assert.deepEqual((await names(env)).filter((n) => ["queue_pr", "set_weight", "cancel_queued"].includes(n)), ["queue_pr"]);
+    // As a maintainer with an answering token it is offered the maintainer's set.
+    assert.deepEqual((await names(env)).filter((n) => ["queue_pr", "set_weight", "cancel_queued"].includes(n)), ["set_weight", "queue_pr", "cancel_queued"]);
   });
 
   test("queue_pr pre-approves the PR at its head and fast-tracks it with the weight, as the Queue page does", async () => {

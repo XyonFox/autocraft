@@ -48,7 +48,7 @@ export function buildFlow(c: Record<string, number>, meta: FlowMeta): Flow {
     decide: { summary: openDec ? `${plural(openDec, "decision")} waiting` : "Nothing waiting", recent: ["asked", "answered"], facts: [{ label: "Open decisions", value: fmt(openDec) }], hints: { open: plural(openDec, "open scope decision") } },
     labels: { summary: `${fmt(v("labels.labelled"))} labelled · ${fmt(v("x.approved"))} of ${plural(repos, "repo")} approved`, recent: ["labelled"], facts: [{ label: "Repos approved", value: `${fmt(v("x.approved"))} of ${fmt(repos)}` }] },
     review: { summary: `${fmt(v("review.not-reviewed"))} to review · ${fmt(v("review.total") - v("review.not-reviewed"))} reviewed`, recent: ["reviewed"] },
-    fix: { summary: `${fmt(v("fix.candidates"))} candidates · ${fmt(v("fix.testing"))} in sandbox · ${fmt(v("fix.pr-opened"))} PRs` },
+    fix: { summary: `${fmt(v("fix.queued"))} queued · ${fmt(v("fix.working"))} in progress · ${fmt(v("fix.pr-opened"))} PRs` },
     fixup: { summary: `${fmt(v("fixup.fix"))} to fix up · ${fmt(v("fixup.pushed"))} pushed`, recent: ["pushed"] },
     verify: { summary: `${fmt(v("verify.passed") + v("verify.ci-enough"))} verified · ${fmt(v("verify.waiting"))} to plan`, recent: ["finished"] },
     merge: { summary: `${fmt(v("merge.eligible"))} may merge now · ${fmt(v("merge.total"))} in the queue`, recent: ["merged", "tries"], facts: [{ label: "Merged since tracking began", value: fmt(v("x.mergedAll")) }] },

@@ -11,11 +11,12 @@ import { CheckRow } from "../../ui/molecules/CheckRow";
 import { RadioRow } from "../../ui/molecules/RadioRow";
 import { StepDraft } from "../../ui/molecules/StepDraft";
 import { cn } from "../../ui/cn";
-import { canActOn } from "../decisions/access";
+import { canActOn, canRunDecision } from "../decisions/access";
 import { markStarting } from "./starting";
 import { revealElement } from "../../lib/revealElement";
 import { localActions, useAnswer, useLocal } from "../decisions/state";
 import { useWorkflow } from "../decisions/Workflow";
+import { canRun } from "../../registry/permissions";
 import { COMPOSER_ID } from "./Composer";
 
 /** The thread has one place to write to Opus: the composer at the bottom of the page, in whatever disclosure the page keeps it in. */
@@ -68,10 +69,10 @@ function NoteField({ d, required }: { d: Decision; required?: boolean }) {
   );
 }
 
-/** Operators: run the prepare step for this question again (Opus drafts new choices). */
+/** Whoever runs the repo: run the prepare step for this question again (Opus drafts new choices). */
 function ReprepareButton({ d, user, busy, setBusy, setError, text }: { d: Decision; user: User; busy: boolean; setBusy: (b: boolean) => void; setError: (e?: string) => void; text?: boolean }) {
   const api = useApi();
-  if (user.role !== "operator" || d.number === null || d.group.length > 0) return null;
+  if (!canRunDecision(user, d) || d.number === null || d.group.length > 0) return null;
   const run = async () => {
     setError(undefined);
     setBusy(true);
@@ -97,7 +98,7 @@ function ReprepareButton({ d, user, busy, setBusy, setError, text }: { d: Decisi
 
 function SnoozeButton({ d, user, busy, setBusy, setError, text }: { d: Decision; user: User; busy: boolean; setBusy: (b: boolean) => void; setError: (e?: string) => void; text?: boolean }) {
   const api = useApi();
-  if (user.role !== "operator") return null;
+  if (!canRunDecision(user, d)) return null;
   const snooze = async () => {
     setError(undefined);
     setBusy(true);
@@ -177,6 +178,7 @@ function ChoiceForm({ d, user, choices, onAnswered }: { d: Decision; user: User;
   const api = useApi();
   const note = useLocal().notes[d.id] ?? "";
   const operator = user.role === "operator";
+  const canEditInstructions = canRun(user, d.repo);
   const [key, setKey] = useState(choices.pick?.core ?? "");
   const [state, setState] = useState<Record<string, CoreState>>({});
   // Drafts open for editing, as "<core>:<reason|instructions|extra id>".
@@ -259,7 +261,7 @@ function ChoiceForm({ d, user, choices, onAnswered }: { d: Decision; user: User;
     try {
       const params: NonNullable<DoChoiceBody["params"]> = {};
       if (core.params?.reason !== undefined) params.reason = reason;
-      if (operator && cs.instructions !== undefined && cs.instructions !== core.params?.instructions) params.instructions = cs.instructions;
+      if (canEditInstructions && cs.instructions !== undefined && cs.instructions !== core.params?.instructions) params.instructions = cs.instructions;
       const body: DoChoiceBody = {
         core: core.key,
         ...(Object.keys(params).length ? { params } : {}),
@@ -310,7 +312,7 @@ function ChoiceForm({ d, user, choices, onAnswered }: { d: Decision; user: User;
           editing={isEditing("instructions")}
           onToggle={() => cancelEdit("instructions", (s) => ({ ...s, instructions: undefined }))}
           disabled={busy || running}
-          readOnly={!operator}
+          readOnly={!canEditInstructions}
           label="Fix-up instructions"
           preview={<blockquote className={quote}>{instructions}</blockquote>}
           editor={<Textarea value={instructions ?? ""} maxLength={1500} onChange={(e) => patch(c.key, (s) => ({ ...s, instructions: e.target.value }))} rows={5} aria-label="Fix-up instructions" disabled={busy || running} className={area} />}

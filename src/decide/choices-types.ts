@@ -107,6 +107,8 @@ export interface ChoicesRow {
   pick: { core: CoreKey | null; reason: string | null };
   state: "current" | "replaced";
   createdAt: string;
+  /** Source conversation: the login whose message the reply that wrote it answered. */
+  askedBy?: string | null;
 }
 
 // ---- Parsed model block (the fenced `choices` block) -------------------------------

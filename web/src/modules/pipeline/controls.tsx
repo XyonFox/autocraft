@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PauseIcon, PlayIcon } from "@phosphor-icons/react";
 import { useApi, useQuery } from "../../api/client";
-import type { PipelineState, StageLimit } from "../../api/types";
+import type { PipelineState, StageLimit, StageTrip } from "../../api/types";
 import { dayResetLocal, num, when } from "../../lib/format";
 import { TimeAgo } from "../../ui/atoms/TimeAgo";
 import { useUser } from "../../shell/UserContext";
@@ -15,6 +15,7 @@ import { ItemRef } from "../../ui/molecules/ItemRef";
 import { repoSlug } from "../../lib/links";
 import { Block, ConfirmButton, ErrorLine, TextInput, useWrite } from "../admin/parts";
 import { useNow } from "../../lib/useNow";
+import { cn } from "../../ui/cn";
 
 const usePipelineState = () => useQuery<PipelineState>("pipeline-state", (a) => a.pipeline.state());
 
@@ -122,21 +123,46 @@ function ResetCount({ l }: { l: StageLimit }) {
   );
 }
 
-/** Operators clear a pause the circuit breaker set. */
-function ResumeTrip({ l }: { l: StageLimit }) {
+/** A stage's circuit breaker tripped on one repo or on every repo; Resume shows for whoever the server allows (an operator; for one repo also a maintainer with write access to it). */
+function TripLine({ t, stage }: { t: StageTrip; stage?: string }) {
   const api = useApi();
   const write = useWrite();
-  if (!l.tripped) return null;
-  const stage = l.tripped;
   return (
-    <>
-      <ConfirmButton label="Resume" confirmLabel="Confirm resume" loading={write.busy === "resume"} onConfirm={() => void write.run("resume", () => api.pipeline.resumeTrip(stage))} />
-      <ErrorLine error={write.error} />
-    </>
+    <li className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded border border-warn/40 bg-warn/10 px-3 py-2">
+      <div className="min-w-0 flex-1 basis-60">
+        <div className="flex flex-wrap items-center gap-2">
+          {stage && <span className="text-sm font-medium">{stage}</span>}
+          {t.repo ? <span className="code text-sm font-medium">{t.repo}</span> : <span className="text-sm font-medium">all repos</span>}
+          <Badge tone="warn">Tripped</Badge>
+          <TimeAgo iso={t.since} className="text-xs text-ink/50" />
+        </div>
+        {t.reason && <p className="mt-0.5 break-words text-sm text-ink/70">{t.reason}</p>}
+      </div>
+      {t.canResume && (
+        <div className="flex flex-col items-end gap-1">
+          <ConfirmButton label="Resume" confirmLabel="Confirm resume" target={`${stage ? `${stage} ` : ""}${t.repo ?? "all repos"}`} loading={write.busy === "resume"} onConfirm={() => void write.run("resume", () => api.pipeline.resumeTrip(t.key))} />
+          <ErrorLine error={write.error} />
+        </div>
+      )}
+    </li>
   );
 }
 
+/** The repos where the stage's breaker tripped, oldest first. */
+function StageTrips({ l, className }: { l: StageLimit; className?: string }) {
+  if (!l.trips?.length) return null;
+  return (
+    <ul aria-label={`${l.title}: tripped breakers`} className={cn("flex flex-col gap-2", className)}>
+      {l.trips.map((t) => <TripLine key={t.key} t={t} />)}
+    </ul>
+  );
+}
+
+const trippedIn = (trips: StageTrip[]) => (trips.some((t) => t.repo === null) ? "Tripped on all repos" : `Tripped in ${trips.length} repo${trips.length === 1 ? "" : "s"}`);
+
 function PauseBadge({ l }: { l: StageLimit }) {
+  // A trip on every repo is the pause reason; StageTrips shows it.
+  if (l.trips?.some((t) => t.repo === null)) return null;
   if (l.pausedReason) return <Badge tone="warn">{l.pausedReason}</Badge>;
   return l.status ? <span className="text-xs text-ink/50">{l.status}</span> : null;
 }
@@ -184,8 +210,8 @@ export function StageLimitRow({ step }: { step: string }) {
       </span>
       {operator && <ResetCount l={l} />}
       <PauseBadge l={l} />
-      {operator && <ResumeTrip l={l} />}
       {operator && <LimitEditor l={l} />}
+      <StageTrips l={l} className="basis-full" />
     </div>
   );
 }
@@ -218,8 +244,9 @@ export function StageLimits() {
                   <td className="px-3 py-1.5">{operator ? <LimitEditor l={l} /> : limitText(l)}</td>
                   <td className="px-3">
                     <div className="flex flex-wrap items-center gap-2">
-                      {l.pausedReason ? <Badge tone="warn">{l.pausedReason}</Badge> : <span className="text-ink/45">{l.status ?? "ready"}</span>}
-                      {operator && <ResumeTrip l={l} />}
+                      {/* A trip on every repo is the pause reason; its row below the table says why. */}
+                      {l.trips?.some((t) => t.repo === null) ? null : l.pausedReason ? <Badge tone="warn">{l.pausedReason}</Badge> : <span className="text-ink/45">{l.status ?? "ready"}</span>}
+                      {l.trips?.length ? <Badge tone="warn">{trippedIn(l.trips)}</Badge> : null}
                       {operator && <ResetCount l={l} />}
                     </div>
                   </td>
@@ -228,6 +255,12 @@ export function StageLimits() {
             </tbody>
           </table>
         </div>
+      )}
+      {/* Outside the scrolling table, so the reason and Resume fit a phone screen. */}
+      {q.data?.limits.some((l) => l.trips?.length) && (
+        <ul aria-label="Tripped breakers" className="flex flex-col gap-2 border-t border-line p-3">
+          {q.data.limits.flatMap((l) => (l.trips ?? []).map((t) => <TripLine key={t.key} t={t} stage={l.title} />))}
+        </ul>
       )}
     </Block>
   );

@@ -3,6 +3,7 @@ import { FastForwardIcon, PauseIcon, PlayIcon } from "@phosphor-icons/react";
 import { useApi, useQuery } from "../../api/client";
 import type { FastPosition } from "../../api/types";
 import { useUser } from "../../shell/UserContext";
+import { canRun } from "../../registry/permissions";
 import { Button } from "../../ui/atoms/Button";
 import { ErrorLine, useWrite } from "../admin/parts";
 
@@ -37,10 +38,10 @@ export function FastMarkFor({ repo, number }: { repo: string; number: number }) 
   return <FastMark fast={i < 0 ? null : { position: i + 1, of: refs.length }} />;
 }
 
-/** Operators only. */
+/** Whoever runs the repo. */
 export function FastToggle({ repo, number, className }: { repo: string; number: number; className?: string }) {
   const api = useApi();
-  const operator = useUser().role === "operator";
+  const operator = canRun(useUser(), repo);
   const refs = useFastTrack();
   const write = useWrite();
   if (!operator) return null;
@@ -62,10 +63,10 @@ export function FastToggle({ repo, number, className }: { repo: string; number: 
   );
 }
 
-/** Operators only; for pull requests. */
+/** Whoever runs the repo; for pull requests. */
 export function HoldToggle({ repo, number, className }: { repo: string; number: number; className?: string }) {
   const api = useApi();
-  const operator = useUser().role === "operator";
+  const operator = canRun(useUser(), repo);
   const held = useHeldMerges();
   const write = useWrite();
   if (!operator) return null;

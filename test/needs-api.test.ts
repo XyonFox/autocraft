@@ -11,7 +11,7 @@ const as = (role: "viewer" | "operator", query: Record<string, string> = {}): Re
   user: { login: "u", role, canWrite: async () => true, canRead: async (r: string) => r !== "secret" }, csrf: "", nonce: "",
 });
 
-test("needs lists feedback newest first with handled state, shows a tripped breaker, and hides a private repo from a viewer", async () => {
+test("needs lists feedback newest first with handled state, shows a tripped breaker per repo, and hides a private repo from a viewer", async () => {
   const db = await connectDb(":memory:");
   const now = Date.now();
   const at = (h: number) => new Date(now - h * 3600_000).toISOString();
@@ -39,7 +39,8 @@ test("needs lists feedback newest first with handled state, shows a tripped brea
   await db.run(db.k.updateTable("comments").set({ mentions_pipeline: 1 }).where((eb) => kx.like(db, "body", eb.val("@bot%")))); // what the mirror sets when it writes the comment
   await db.run(db.k.insertInto("decisions").values({ id: "d1", kind: "scope", repo: "photocraft", number: 2, question: "Q?", options: "[]", asked_at: at(20), answer: "yes", answered_at: at(5) }));
   await db.run(db.k.insertInto("decision_comments").values({ id: "dc1", decision_id: "d1", login: "maint", at: at(6), body: "before the answer" }));
-  await db.run(db.k.insertInto("stage_trips").values({ stage: "merge", active: 1, reason: "two merges broke main", evidence: "[]", tripped_at: at(1) }));
+  await db.run(db.k.insertInto("stage_trips").values({ stage: "merge:photocraft", active: 1, reason: "two merges broke main", evidence: "[]", tripped_at: at(1) }));
+  await db.run(db.k.insertInto("stage_trips").values({ stage: "fixup:secret", active: 1, reason: "2 of the last 10 fixup pushes in secret broke a required check", evidence: "[]", tripped_at: at(2) }));
 
   const op = (await needs(db, as("operator", { feedback: "1" }))) as NeedsPage;
   assert.deepEqual(op.feedback!.rows.map((r) => [r.id, r.handled]), [["comment:c4", false], ["comment:c7", false], ["comment:c6", false], ["decision-comment:dc1", true], ["comment:c1", true]]);
@@ -47,7 +48,10 @@ test("needs lists feedback newest first with handled state, shows a tripped brea
   assert.equal(op.counts.feedback, 3);
   assert.equal(op.feedback!.rows.find((r) => r.id === "decision-comment:dc1")!.href, "/needs/decisions/d1", "the decision is opened by its id");
   assert.equal(op.counts.decisions, 0);
-  assert.deepEqual(op.stopped.map((s) => [s.id, s.resume]), [["breaker:merge", { type: "trip", stage: "merge" }]]);
+  assert.deepEqual(op.stopped.map((s) => [s.id, s.repo, s.resume]), [
+    ["breaker:fixup:secret", "secret", { type: "trip", stage: "fixup:secret", canResume: true }],
+    ["breaker:merge:photocraft", "photocraft", { type: "trip", stage: "merge:photocraft", canResume: true }],
+  ]);
 
   const paged = (await needs(db, as("operator", { feedback: "1", limit: "3" }))) as NeedsPage;
   const next = (await needs(db, as("operator", { feedback: "1", limit: "3", cursor: paged.feedback!.nextCursor! }))) as NeedsPage;
@@ -55,5 +59,6 @@ test("needs lists feedback newest first with handled state, shows a tripped brea
 
   const viewer = (await needs(db, as("viewer", { feedback: "1" }))) as NeedsPage;
   assert.ok(!viewer.feedback!.rows.some((r) => r.item?.repo === "secret"));
+  assert.deepEqual(viewer.stopped.map((s) => s.id), ["breaker:merge:photocraft"], "a trip on a hidden repo is left out");
   assert.equal(viewer.counts.feedback, 2);
 });

@@ -20,6 +20,7 @@ import {
   maybe,
   synced,
   useRepoWrite,
+  type Write,
 } from "./repoParts";
 import { useNow } from "../../lib/useNow";
 
@@ -120,7 +121,7 @@ export function ReposView(_: ViewProps) {
         aside={phone ? undefined : "Open counts come from the last sync"}
       >
         {!data && !error && <p className="p-4 text-sm text-ink/50">Loading…</p>}
-        {data && (phone ? <Cards rows={rows} /> : <Table rows={rows} />)}
+        {data && (phone ? <Cards rows={rows} write={write} /> : <Table rows={rows} />)}
       </Block>
     </Page>
   );
@@ -200,13 +201,13 @@ function Table({ rows }: { rows: TrackedRepo[] }) {
   );
 }
 
-function Cards({ rows }: { rows: TrackedRepo[] }) {
+function Cards({ rows, write }: { rows: TrackedRepo[]; write: Write }) {
   useNow();
   return (
     <ul>
       {rows.map((r) => (
-        <li key={r.name} className="border-b border-line last:border-0">
-          <Link to={`/repos/${r.name}`} className="block px-4 py-2.5">
+        <li key={r.name} className="relative border-b border-line last:border-0">
+          <Link to={`/repos/${r.name}`} className={cn("block px-4 py-2.5", r.canSwitch && "pr-16")}>
             <div className="flex items-center gap-2">
               <span className="code truncate">{r.name}</span>
               {r.tracked ? (
@@ -214,7 +215,7 @@ function Cards({ rows }: { rows: TrackedRepo[] }) {
               ) : (
                 <Badge>Not tracked</Badge>
               )}
-              {r.tracked && <PipelineBadge r={r} />}
+              {r.tracked && !r.canSwitch && <PipelineBadge r={r} />}
             </div>
             <div className="num mt-0.5 text-xs text-ink/55">
               {maybe(r.openPrs)} PRs · {maybe(r.openIssues)} issues · synced{" "}
@@ -226,6 +227,11 @@ function Cards({ rows }: { rows: TrackedRepo[] }) {
               </div>
             )}
           </Link>
+          {r.tracked && r.canSwitch && (
+            <div className="absolute right-6 top-3.5">
+              <PipelineSwitch r={r} write={write} />
+            </div>
+          )}
         </li>
       ))}
     </ul>

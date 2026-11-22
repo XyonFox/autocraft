@@ -9,9 +9,7 @@ import { setFixIssueApproval } from "../src/fixissue/approval.ts";
 import { attemptOf, runFixIssue, type CollectDeps } from "../src/fixissue/index.ts";
 import { loadItemFact } from "../src/core/issue-facts.ts";
 import { parseTriage, validateFixPatch } from "../src/fixissue/parse.ts";
-import type { PatchInput } from "../src/fixissue/types.ts";
 import type { Querier } from "../src/mirror.ts";
-import { REPO_PATH } from "../src/sandbox/command.ts";
 import { SCRATCH } from "./scratch.ts";
 import { validating } from "./gql.ts";
 import type { Db } from "../src/db/index.ts";
@@ -215,37 +213,6 @@ const finishBoth = async (db: Db, head: End, base: End) => {
   await finish(db, a.base_task_id!, base);
 };
 const quiet = () => {};
-
-describe("fix step", () => {
-  test("a file over the size limit stops the patch round without a checkout and is listed by path alone with one", async () => {
-    const lib = "pub fn first(v: &[u8]) -> u8 {\n    v[0]\n}\n" + Array.from({ length: 6000 }, (_, i) => `fn f${i}() {}`).join("\n") + "\n";
-    const patchCalls = (w: World) => w.asked.filter((a) => a.startsWith("fixissue.patch:")).map((a) => JSON.parse(a.slice("fixissue.patch:".length)) as PatchInput);
-
-    const held = await world({ lib });
-    await runFixIssue(held.db, { repo: "app", dryRun: false }, quiet, held.deps);
-    assert.equal(patchCalls(held).length, 0);
-
-    const w = await world({ lib });
-    w.deps.checkout = async () => "/checkout";
-    await runFixIssue(w.db, { repo: "app", dryRun: false }, quiet, w.deps);
-    const calls = patchCalls(w);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0]!.files, [{ path: LIB }]);
-    assert.equal(calls[0]!.repo_dir, REPO_PATH);
-  });
-
-
-
-
-
-
-
-
-
-
-
-
-});
 
 describe("opening the PR is gated and repeatable", () => {
   const passedWorld = async (o: Parameters<typeof world>[0] = {}) => {

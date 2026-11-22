@@ -12,6 +12,8 @@ import { featureOn } from "../build/features.ts";
 import { envVar } from "../env.ts";
 import { stageOfStep } from "../stages/registry.ts";
 import { stepDeadlineMin } from "./deadlines.ts";
+import { CLAUDE_PROMPTS } from "../prompts/index.ts";
+import { IMPLEMENT_BUCKETS } from "../implement/types.ts";
 import { mapSeq } from "../async-seq.ts";
 import { jobRunId } from "./resuming.ts";
 import type { Db } from "../db/index.ts";
@@ -126,6 +128,12 @@ async function checkPushApproved(db: Db, p: Params): Promise<string | null> {
   const { pushApprovalOf } = await import("../fixup/approval.ts");
   const { commentApprovalOf } = await import("../act/approval.ts");
   return await pushApprovalOf(db, String(p.repo)) || await commentApprovalOf(db, String(p.repo)) ? null : `pushing fix-ups or commenting in ${p.repo} is not approved`;
+}
+
+/** An implementation needs the repo's issue implementation approval, its Implement switch and a queuer who settles on it. */
+async function checkImplement(db: Db, p: Params): Promise<string | null> {
+  const { implementRefusal } = await import("../implement/gate.ts");
+  return await implementRefusal(db, String(p.repo), Number(p.number)) ?? "Implement is not built yet";
 }
 
 /** Opening fix PRs from issues is opt-in per repo. */
@@ -484,6 +492,26 @@ export const STEPS: StepDef[] = [
     },
   },
   {
+    name: "implement",
+    priority: 1,
+    title: "Implement issues",
+    description: "Works one queued issue on workspace sessions: plans it with Opus (asking when the issue leaves facts or choices open), writes the change and its tests, runs the formatter, clippy and the tests in the workspace, and opens the pull request; or revises our open PR. Every model call runs on the Task Runner of the person who queued the issue.",
+    stage: runStage("implement"),
+    requires: "operator",
+    models: ["opus"],
+    params: [
+      { name: "repo", label: "Repo", kind: "repo", required: true },
+      { name: "number", label: "Issue", kind: "int", min: 1, max: 1_000_000_000, required: true, help: "the queued issue" },
+      { name: "bucket", label: "Work", kind: "enum", options: [...IMPLEMENT_BUCKETS], default: "plan", help: "plan, build from the stored plan, or revise our PR" },
+    ],
+    check: checkImplement,
+    run: async (ctx) => {
+      const refused = await checkImplement(ctx.db, ctx.params);
+      if (refused) throw new Error(refused);
+      return `${ctx.params.repo}#${ctx.params.number}: nothing was done`;
+    },
+  },
+  {
     name: "fixissue",
     priority: 1,
     title: "Fix issues",
@@ -520,6 +548,27 @@ export const STEPS: StepDef[] = [
       ctx.usageRun(r.runId);
       ctx.handled(r.changed);
       return `${r.looked} pending: ${r.passed} passed, ${r.opened} PRs opened, ${r.failedRounds} failed rounds, ${r.failed} failed, ${r.retried} retried`;
+    },
+  },
+  {
+    name: "workspace-try",
+    priority: 1,
+    title: "Workspace session",
+    description: "An operator's test of a model session in a workspace pod: creates the workspace (or takes a live one), waits for it to be ready, runs one session with the implementation model through the workspace tools, and logs the outcome, cost, tool calls, shell time and the diff stat. Started only with `workspace try` on the command line; nothing goes to GitHub.",
+    stage: runStage("workspace-try"),
+    requires: "operator",
+    models: [CLAUDE_PROMPTS["fixissue.patch"].models[0]],
+    params: [
+      { name: "repo", label: "Repo", kind: "repo", required: true },
+      { name: "session", label: "Session", kind: "int", min: 1, max: 1_000_000_000, required: true, help: "the session row `workspace try` created" },
+    ],
+    check: async (db, p) => {
+      const { checkTrySession } = await import("../build/workspace-session.ts");
+      return await checkTrySession(db, p);
+    },
+    run: async (ctx) => {
+      const { runTrySession } = await import("../build/workspace-session.ts");
+      return await runTrySession(ctx);
     },
   },
   {
@@ -791,14 +840,30 @@ export const STEPS: StepDef[] = [
     name: "conversation",
     priority: 1,
     title: "Answer conversations",
-    description: "Answers each operator message in an item's conversation with one Opus call, with read-only tools on the item's repository, the workspace and the item tools. The reply may propose action cards that an operator runs with a button; nothing runs by itself. Messages are answered even for a repo whose pipeline is off. Each answered message counts as one item.",
+    description: "Answers each operator's message in an item's conversation with one Opus call, with read-only tools on the item's repository, the workspace and the item tools. The reply may propose action cards that an operator runs with a button; nothing runs by itself. Messages are answered even for a repo whose pipeline is off. Each answered message counts as one item.",
     stage: runStage("conversation"),
     requires: "operator",
     models: ["opus"],
     params: [{ name: "limit", label: "At most", kind: "int", min: 1, max: 200, default: 30, help: "messages to answer in this job" }],
     run: async (ctx) => {
       const { runConversations } = await import("../conversations/run.ts");
-      const r = await runConversations(ctx.db, { limit: Number(ctx.params.limit), onHandled: ctx.handled, cancelled: ctx.cancelled }, ctx.log);
+      const r = await runConversations(ctx.db, { kind: "operator", limit: Number(ctx.params.limit), onHandled: ctx.handled, cancelled: ctx.cancelled }, ctx.log);
+      ctx.usageRun(r.usageRun);
+      return `${r.answered} of ${r.waiting} messages answered`;
+    },
+  },
+  {
+    name: "conversation-maintainer",
+    priority: 1,
+    title: "Answer maintainers' conversations",
+    description: "Answers each maintainer's message in an item's conversation with one Opus call on that maintainer's own Task Runner, which takes it beside its other calls, with the same tools as the operators' conversations. A message none of their runners takes within two minutes waits for a later job. The reply may propose action cards; nothing runs by itself. These calls use the maintainers' own subscriptions, so the step has no daily limit and its messages do not count toward the operators' conversations.",
+    stage: runStage("conversation-maintainer"),
+    requires: "operator",
+    models: ["opus"],
+    params: [],
+    run: async (ctx) => {
+      const { runConversations } = await import("../conversations/run.ts");
+      const r = await runConversations(ctx.db, { kind: "maintainer", onHandled: ctx.handled, cancelled: ctx.cancelled }, ctx.log);
       ctx.usageRun(r.usageRun);
       return `${r.answered} of ${r.waiting} messages answered`;
     },

@@ -169,6 +169,16 @@ test("the file tools read only inside the mounts: no path outside them, no symli
   }
 });
 
+test("a Claude run that started without one of the call's MCP servers is stopped", () => {
+  const init = (mcp: object[]) => JSON.stringify({ type: "system", subtype: "init", cwd: "/work", session_id: "s", tools: [], mcp_servers: mcp });
+  const servers = ["items", "work"];
+  assert.equal(helper.claudeMcpProblem(init([{ name: "items", status: "connected" }, { name: "work", status: "pending" }]), servers), null);
+  // Claude Code leaves a server it will not load (a reserved name) out of the list, and marks one it could not reach failed.
+  assert.match(helper.claudeMcpProblem(init([{ name: "items", status: "connected" }]), servers) ?? "", /no work tools/);
+  assert.match(helper.claudeMcpProblem(init([{ name: "items", status: "failed" }, { name: "work", status: "connected" }]), servers) ?? "", /no items tools/);
+  assert.equal(helper.claudeMcpProblem(init([]), []), null);
+});
+
 test("only audited Codex versions run, and a tool outside the call's MCP servers and view_image fails the call", () => {
   assert.equal(helper.codexUnaudited("0.170.3"), null);
   assert.match(helper.codexUnaudited("0.171.0") ?? "", /not a version this helper has audited \(0\.170\.x\)/);

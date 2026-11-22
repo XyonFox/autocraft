@@ -88,7 +88,7 @@ export async function stopBatch(db: Db, by: string, id: number, run: Exec = defa
   const prs = (await membersOf(db, id)).map((m) => m.number);
   await audit(db, by, "batch-stop", `${b.repo}:${b.branch}`, { prs });
   const held = await filterSeq(prs, async (n) => await db.get(db.k.selectFrom("main.items").select((eb) => eb.lit(1).as("one")).where("repo", "=", b.repo).where("number", "=", n).where("state", "=", "OPEN")) && await holdMerge(db, by, b.repo, n, { batch: b.branch }));
-  const { closed } = await endBatch(db, by, id, "stopped by an operator", "the batch was stopped by an operator. Its pull requests are held until released", run);
+  const { closed } = await endBatch(db, by, id, `stopped in AutoCraft by ${by}`, `the batch was stopped in AutoCraft by ${by}. Its pull requests are held until released`, run);
   return { batch: b.branch, prs, held, closed };
 }
 
@@ -98,7 +98,7 @@ export async function removeFromBatch(db: Db, by: string, repo: string, number: 
   if (!b) throw new ControlError(`${refOf(repo, number)} is not in a batch in flight`);
   await holdMerge(db, by, repo, number, { batch: b.branch });
   await audit(db, by, "batch-remove", refOf(repo, number), { batch: b.branch });
-  const { closed } = await endBatch(db, by, b.id, `${refOf(repo, number)} was removed by an operator`, `${refOf(repo, number)} was removed from the batch by an operator. The other pull requests are rebuilt in a new batch`, run);
+  const { closed } = await endBatch(db, by, b.id, `${refOf(repo, number)} was removed in AutoCraft by ${by}`, `${refOf(repo, number)} was removed from the batch in AutoCraft by ${by}. The other pull requests are rebuilt in a new batch`, run);
   return { batch: b.branch, closed };
 }
 

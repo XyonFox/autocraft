@@ -10,11 +10,12 @@ import { ConfirmButton } from "../../ui/molecules/ConfirmButton";
 import { itemPath } from "../../lib/links";
 import { useWrite } from "../../lib/hooks";
 import { useUser } from "../../shell/UserContext";
+import { canRun } from "../../registry/permissions";
 
 function HeldRow({ row, onDone }: { row: NeedsOutsideRow; onDone: () => void }) {
   const api = useApi();
   const write = useWrite();
-  const operator = useUser().role === "operator";
+  const operator = canRun(useUser(), row.repo);
   return (
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line py-3 pl-8 pr-4">
       <div className="min-w-0 flex-1 basis-60">

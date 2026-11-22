@@ -56,7 +56,7 @@ An operator starts a scan of one repo's default branch. Opus looks for vulnerabi
 
 ## Conversations
 
-Each item can have a conversation with Opus next to its decision. Everyone with access to the repo can read it. Only operators write. Opus answers with read-only access to the repo.
+Each item can have a conversation with Opus next to its decision. Everyone with access to the repo can read it. Operators write, and so do maintainers with write access to the repo; a maintainer's messages are answered on their own Task Runner. Opus answers with read-only access to the repo.
 
 ## What needs a person
 

@@ -1,8 +1,13 @@
 // `autocraft-server inference [server|user-local]`: shows or sets the inference mode (src/remote/mode.ts). `autocraft-server remote cooloff clear <login>`: ends the cool-off of a login's helpers (src/remote/cooloff.ts).
 // `autocraft-server remote token <login>`: makes a Task Runner credential for a maintainer or operator and prints only the credential,
 // so it can be piped into `autocraft login --stdin` on the same host without anyone seeing it (no device login needed).
+// `autocraft-server remote test-call <login> [<repo>#<n>] [--slot]`: queues a one-line small-tier call bound to the login's own
+// Task Runners (in a slot with --slot, else their own lane), waits for it and prints the lane that took it.
 import { audit } from "../dash/audit.ts";
 import { createToken, MCP_TOKENS_PER_LOGIN } from "../dash/mcp/tokens.ts";
+import { CLAUDE_PROMPTS } from "../prompts/index.ts";
+import type { ItemRef } from "../../web/src/api/types.ts";
+import { awaitCall, enqueueCall } from "./calls.ts";
 import { clearCooloff } from "./cooloff.ts";
 import { inferenceMode, isInferenceMode, setInferenceMode } from "./mode.ts";
 import { openDb } from "../db/open.ts";
@@ -25,9 +30,10 @@ export const commands = {
     },
   },
   remote: {
-    summary: "remote cooloff clear <login>: lets the login's helpers claim calls again after a cool-off; remote token <login> [--label <text>]: a Task Runner credential on stdout, for piping into autocraft login --stdin",
+    summary: "remote cooloff clear <login>: lets the login's helpers claim calls again after a cool-off; remote token <login> [--label <text>]: a Task Runner credential on stdout, for piping into autocraft login --stdin; remote test-call <login> [<repo>#<n>] [--slot]: a one-line call on the login's own Task Runner",
     async run(args: string[]): Promise<void> {
       if (args[0] === "token") return await makeToken(args.slice(1));
+      if (args[0] === "test-call") return await testCall(args.slice(1));
       if (args[0] !== "cooloff" || args[1] !== "clear" || !args[2] || args.length > 3) {
         console.error("usage: autocraft-server remote cooloff clear <login>");
         process.exit(1);
@@ -69,4 +75,54 @@ async function makeToken(args: string[]): Promise<void> {
   await audit(db, "cli", "runner-approve", login, { id: row.id, label: row.label ?? undefined, via: "cli" });
   process.stdout.write(`${token}\n`);
   console.error(`made Task Runner credential ${row.id} (${row.label ?? "no label"}) for ${login}; remove it on the Connect page`);
+}
+
+const TEST_CALL_USAGE = "usage: autocraft-server remote test-call <login> [<repo>#<n>] [--slot]";
+const TEST_CALL_WAIT_MS = 15 * 60_000;
+
+/**
+ * Queues a small-tier call with a one-line prompt bound to `login` and waits for its reply. Without an item the call names no
+ * repo, which only an operator's runner takes. Prints the lease's lane: the slot lane counts toward Max calls at once.
+ */
+async function testCall(args: string[]): Promise<void> {
+  const slot = args.includes("--slot");
+  const rest = args.filter((a) => a !== "--slot");
+  const [login, item] = rest;
+  const at = item?.lastIndexOf("#") ?? -1;
+  const ref: ItemRef | null = item && at > 0 && /^[0-9]+$/.test(item.slice(at + 1)) ? { repo: item.slice(0, at), number: Number(item.slice(at + 1)) } : null;
+  if (!login || login.startsWith("-") || rest.length > 2 || (item !== undefined && !ref)) {
+    console.error(TEST_CALL_USAGE);
+    process.exit(1);
+  }
+  const db = await openDb();
+  if (await inferenceMode(db) !== "user-local") {
+    console.error("refused: the inference mode is server; Task Runners take calls only in user-local");
+    process.exit(1);
+  }
+  // access.login compares without case (NOCASE, citext): the call is bound to the login as the access list spells it.
+  const user = await db.get(db.k.selectFrom("access").select(["login", "role"]).where("login", "=", login));
+  const role = user?.role;
+  if (!user || (role !== "maintainer" && role !== "operator")) {
+    console.error(`refused: ${login} is ${role ? `a ${role}` : "not on the access list"}; only maintainers and operators run model calls`);
+    process.exit(1);
+  }
+  const promptId = "remote.test", model = CLAUDE_PROMPTS["classify.haiku"].models[0]!;
+  const args0 = ["-p", "--model", model, "--effort", "low", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"];
+  const id = await enqueueCall(db, {
+    promptId, promptVersion: "1", tier: "small", effort: "low", askedModel: model, items: ref ? [ref] : [], level: 0, maxAttempts: 1, forLogin: user.login, boundSlot: slot,
+    bundle: { promptId, promptVersion: "1", tier: "small", effort: "low", timeoutSeconds: 120, maxTurns: null, stdin: "Reply with the single word: ok", system: null, mounts: [], mcpServers: [], keepSession: false, hints: { claude: { args: args0 } } },
+  });
+  console.log(`queued call ${id} for ${user.login}'s Task Runner (${slot ? "a slot" : "the own lane"}); waiting up to ${TEST_CALL_WAIT_MS / 60_000} min`);
+  let reply: string | null = null;
+  try {
+    const o = await awaitCall(db, id, { maxWaitMs: TEST_CALL_WAIT_MS, log: (line) => console.error(line) });
+    if (o.state === "done") reply = o.text.trim().slice(0, 80);
+  } catch (e) {
+    // A wait limit or a missing taker: the call was withdrawn, and its row says why.
+    console.error((e as Error).message);
+  }
+  const r = (await db.get(db.k.selectFrom("remote_calls").select(["state", "user_login", "own_lane", "error"]).where("id", "=", id)))!;
+  const lane = r.user_login === null ? "no lease" : `leased by ${r.user_login} in ${Number(r.own_lane) === 1 ? "the own lane" : "a slot"}`;
+  console.log(`call ${id}: ${r.state}, ${lane}${reply !== null ? `; reply: ${reply}` : r.error ? `; ${r.error}` : ""}`);
+  if (reply === null) process.exit(1);
 }

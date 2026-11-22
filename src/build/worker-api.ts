@@ -2,6 +2,9 @@
 // default 127.0.0.1:8981), separate from the dashboard. Workers authenticate with a bearer
 // key; every call refreshes the environment's heartbeat. Bodies are size-capped and
 // everything a worker sends is stored as data, never executed, rendered or put in a prompt.
+// Under /remote/ it also serves what a remote call reads from the runner's disk (the item and
+// reference tools, tarball mounts) to a dashboard that does not share that disk; those requests
+// carry the call's lease secret, checked here as the dashboard checks it.
 import { createWriteStream, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -14,6 +17,13 @@ import { appendLog, claim, finishTask, heartbeat, MAX_CHUNK_BYTES, ownedTask, po
 import { dbReady, serveHealth } from "../health.ts";
 import { envVar } from "../env.ts";
 import type { Db } from "../db/index.ts";
+import { archiveOf, callTaskTool, taskLease } from "../remote/tools.ts";
+import { ITEM_SERVER } from "../itemtools/index.ts";
+import { REFERENCE_SERVER } from "../remote/bundle.ts";
+import { handleInternal } from "./internal-api.ts";
+
+/** Largest tool-call body the runner takes for a dashboard (the dashboard's own limit for these tools). */
+const REMOTE_TOOL_BODY_LIMIT = 2 * 1024 * 1024;
 
 export const DEFAULT_WORKER_LISTEN = "127.0.0.1:8981";
 /** Largest JSON body: a log chunk of 64 KB with its JSON escaping, or a result list. */
@@ -27,6 +37,8 @@ export type WorkerServerOptions = {
   /** Calls a key may make: a burst and a refill per second. */
   burst?: number;
   perSec?: number;
+  /** The secrets file's session_key, which signs the dashboard's /internal/ requests (src/build/internal-api.ts); without it they are refused. */
+  internalKey?: string | null;
 };
 
 class Refusal extends Error {
@@ -104,9 +116,44 @@ export function handler(o: WorkerServerOptions) {
   const { db } = o;
   const calls = new TokenBucket(o.burst ?? 120, o.perSec ?? 40);
   const badAuth = new RateLimiter(30, 60_000);
+  // Per lease, as the dashboard limits them: tool calls and tarball fetches.
+  const remoteTools = new RateLimiter(300, 60_000);
+  const remoteArchives = new RateLimiter(20, 60_000);
+
+  async function remoteRoute(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const secret = /^Bearer (\S{1,200})$/.exec(String(req.headers.authorization ?? ""))?.[1];
+    const lease = secret ? await taskLease(db, secret) : null;
+    if (!lease || !secret) {
+      if (!badAuth.allow(req.socket.remoteAddress ?? "?")) throw new Refusal(429, "too many failed attempts", { "retry-after": "60" });
+      throw new Refusal(401, "a live lease secret is required", { "www-authenticate": "Bearer" });
+    }
+    const method = req.method ?? "GET";
+    if (url.pathname === "/remote/tarball") {
+      if (method !== "GET") throw new Refusal(405, "use GET");
+      if (!remoteArchives.allow(String(lease.id))) throw new Refusal(429, "too many requests", { "retry-after": "60" });
+      const tar = await archiveOf(lease, url.searchParams.get("repo") ?? "", url.searchParams.get("sha") ?? "", { local: true });
+      if (!tar) throw new Refusal(404, "the call has no such tarball");
+      res.writeHead(200, { "content-type": "application/x-tar", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+      // A failed archive cuts the response, so the dashboard and the helper see an error rather than a short tree.
+      tar.on("error", () => res.destroy());
+      res.on("close", () => tar.destroy());
+      return void tar.pipe(res);
+    }
+    const t = /^\/remote\/tools\/([a-z]+)\/([a-z][a-z0-9_]{0,60})$/.exec(url.pathname);
+    if (!t) throw new Refusal(404, "no such endpoint");
+    if (method !== "POST") throw new Refusal(405, "use POST");
+    const server = t[1]!;
+    if (server !== ITEM_SERVER && server !== REFERENCE_SERVER) throw new Refusal(404, "the runner serves only the item and reference tools");
+    if (!remoteTools.allow(String(lease.id))) throw new Refusal(429, "too many requests", { "retry-after": "60" });
+    const args = await readJson(req, REMOTE_TOOL_BODY_LIMIT);
+    const r = await callTaskTool(db, lease, secret, server, t[2]!, args, { local: true });
+    return reply(res, 200, { text: r.text, ...(r.isError && { isError: true }) });
+  }
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://worker.invalid");
+    if (url.pathname.startsWith("/remote/")) return await remoteRoute(req, res, url);
+    if (url.pathname.startsWith("/internal/")) return await handleInternal(db, o.internalKey ?? null, req, res, url);
     const m = /^Bearer (\S{1,200})$/.exec(String(req.headers.authorization ?? ""));
     const addr = req.socket.remoteAddress ?? "?";
     const env = m ? await authenticate(db, m[1]!) : null;

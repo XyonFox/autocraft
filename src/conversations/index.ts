@@ -3,7 +3,7 @@ import { parseRef } from "../classify/parse.ts";
 import { getAccess } from "../access.ts";
 import { doCard } from "./act.ts";
 import { githubDiff, runConversations } from "./run.ts";
-import { ConversationError, addOperatorMessage, turnsOf } from "./store.ts";
+import { ConversationError, addMessage, turnsOf } from "./store.ts";
 import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 
@@ -41,14 +41,14 @@ export const commands = {
           if (!by) throw new ConversationError(2, USAGE);
           await needOperator(db, by);
           const text = args.slice(2).filter((a, i, all) => a !== "--now" && a !== "--by" && all[i - 1] !== "--by").join(" ");
-          await addOperatorMessage(db, ref.repo, ref.number, by, text, { diff: githubDiff(db) });
+          await addMessage(db, ref.repo, ref.number, { login: by, kind: "operator" }, text, { diff: githubDiff(db) });
           console.log(`${ref.repo}#${ref.number}: message queued; the Conversation step answers it`);
           if (args.includes("--now")) {
             // The same gates as the autopilot: the pipeline switch and the step's daily limit.
             const { isEnabled, pauseReason } = await import("../runner/autopilot.ts");
             const why = !await isEnabled(db) ? "the pipeline is off" : await pauseReason(db, "conversation", Date.now(), { backoff: false });
             if (why) console.log(`not answered now: ${why}`);
-            else console.log(`${(await runConversations(db, { limit: 1 })).answered} answered`);
+            else console.log(`${(await runConversations(db, { kind: "operator", limit: 1 })).answered} answered`);
           }
         }
         for (const t of await turnsOf(db, ref.repo, ref.number)) {

@@ -1,4 +1,5 @@
 // The Pipeline page on fake data: a few steps, jobs in every state and recent syncs.
+import { mayRunMock } from "./adminMock";
 import type { Api } from "../client";
 import type { Job, JobDetail, PipelineOverview, PipelineState, PipelineStep, StageLimit, User } from "../types";
 import { NOW, REPOS } from "./fixtures";
@@ -110,7 +111,16 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
     step: step as string, title: title as string, perDay: perDay as number | null, usedToday: usedToday as number,
     pausedReason: perDay !== null && (usedToday as number) >= (perDay as number) ? `daily limit of ${perDay} items reached` : null,
   }));
-  Object.assign(limits.find((l) => l.step === "fixup")!, { tripped: "fixup", pausedReason: "tripped: 2 of the last 10 fixup pushes broke a required check; an operator resumes it" });
+  const wide = "3 of the last 10 fixup pushes broke a required check, in 2 repos (designcraft, photocraft)";
+  Object.assign(limits.find((l) => l.step === "fixup")!, { pausedReason: `tripped: ${wide}; an operator resumes it` });
+  limits.find((l) => l.step === "fixup")!.trips = [
+    { key: "fixup", repo: null, reason: wide, since: iso(30), canResume: true },
+    { key: "fixup:designcraft", repo: "designcraft", reason: "2 of the last 10 fixup pushes in designcraft broke a required check", since: iso(140), canResume: true },
+    { key: "fixup:photocraft", repo: "photocraft", reason: "2 of the last 7 fixup pushes in photocraft broke a required check", since: iso(35), canResume: false },
+  ];
+  limits.find((l) => l.step === "merge")!.trips = [
+    { key: "merge:deckcraft", repo: "deckcraft", reason: "main CI of deckcraft is red after our merge of #2031", since: iso(80), canResume: true },
+  ];
   const pilot: string[] = [];
   const state = (): PipelineState => ({ ...judgement, ...flag, heartbeat: iso(0), limits, pilot: [...pilot], outside: { ...outside } });
   const requireOperator = () => {
@@ -152,7 +162,7 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
       },
       job: (id) => {
         const j = find(id);
-        const d: JobDetail = { ...j, items: JOB_ITEMS[j.id] ?? [], log: j.id === 47 ? LOG : j.startedAt ? `${j.startedAt} job ${j.id}: ${j.step}\n${j.summary ?? j.error ?? ""}` : "", logTruncated: false };
+        const d: JobDetail = { ...j, items: JOB_ITEMS[j.id] ?? [], log: j.id === 47 ? LOG : j.startedAt ? `${j.startedAt} job ${j.id}: ${j.step}\n${j.summary ?? j.error ?? ""}` : "", logTruncated: false, canCancel: me.role === "operator" || (!!j.params.repo && mayRunMock(me, String(j.params.repo))) };
         return wait(d);
       },
       async run(step, params) {
@@ -228,7 +238,7 @@ export function createPipelineMock(me: User, changed: () => void): Pick<Api, "pi
       async resumeTrip(stage) {
         requireOperator();
         if (stage === "outside-surge") resumeSurge();
-        for (const l of limits) if (l.tripped === stage) { delete l.tripped; l.pausedReason = null; }
+        for (const l of limits) if (l.trips) { if (l.step === stage) l.pausedReason = null; l.trips = l.trips.filter((t) => t.key !== stage); if (!l.trips.length) delete l.trips; }
         changed();
         return wait(state(), 30);
       },

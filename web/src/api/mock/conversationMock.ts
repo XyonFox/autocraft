@@ -134,6 +134,7 @@ function seed(): ConversationTurn[] {
     },
     { id: 5, kind: "system", login: "system", at: at(18), body: 'mosswood ran the card: Add the label needs changes. Label added. Note: hold until the pack check is done', actions: [], notes: [] },
     { id: 7, kind: "system", login: "system", at: at(12), body: 'kiri-n answered "Is ruler snapping for gradient stops in scope?" with "Take": fits the editor roadmap', actions: [], notes: [] },
+    { id: 8, kind: "maintainer", login: "kiri-n", at: at(6), body: "Does the pack cover the nonstandard hyphenation rules this PR adds?", actions: [], notes: [], status: "answered" },
     {
       id: 6,
       kind: "opus",
@@ -168,7 +169,7 @@ function seed(): ConversationTurn[] {
 /** In-memory conversations. Only designcraft#1484 starts with one; an operator's message is answered after a few seconds. */
 export function createConversationMock(me: User, changed: () => void, settle?: (repo: string, number: number, option: string, note: string | null) => void, hooks?: { reprepare?: (decisionId: string) => void }, derive?: (repo: string, number: number) => DecisionChoices | null): Pick<Api, "conversations"> {
   // The open choices by item; a run that settles the question removes them.
-  const choices = new Map<string, DecisionChoices>([[REF, mergeChoices(1)], ["photocraft#4127", scopeChoices(1)], ["gridcraft#977", { ...mergeChoices(1), id: "ch-g1", decisionId: "gridcraft#977:merge", pick: null }], ["gridcraft#1012", holdChoices()]]);
+  const choices = new Map<string, DecisionChoices>([[REF, { ...mergeChoices(1), source: "conversation", after: "kiri-n" }], ["photocraft#4127", scopeChoices(1)], ["gridcraft#977", { ...mergeChoices(1), id: "ch-g1", decisionId: "gridcraft#977:merge", pick: null }], ["gridcraft#1012", holdChoices()]]);
   let epoch = 1;
   const failedOnce = new Set<string>();
   if (hooks)
@@ -184,7 +185,10 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
       }, 2500);
     };
   const sys = (id: number, min: number, body: string): ConversationTurn => ({ id, kind: "system", login: "system", at: at(min), body, actions: [], notes: [] });
-  const store = new Map<string, Conversation>([
+  const store = new Map<string, Omit<Conversation, "canTalk" | "canWithdraw">>([
+    ["photocraft#4127", { repo: "photocraft", number: 4127, exists: true, pending: true, startedBy: "kiri-n", includes: [], turns: [
+      { id: 301, kind: "maintainer", login: "kiri-n", at: at(3), body: "Is the wave filter from #3880 the same one this issue asks for?", actions: [], notes: [], status: "pending" },
+    ] }],
     ["vectorcraft#1402", { repo: "vectorcraft", number: 1402, exists: true, pending: false, startedBy: "opus", includes: [], turns: [
       sys(201, 26, "ochre-fox approved a fix-up, then merge. Instructions: rename the curvature toggle and add the shortcut."),
       sys(202, 14, "Fix-up pushed 9a1f3c5."),
@@ -198,7 +202,7 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
     [REF, { repo: "designcraft", number: 1484, exists: true, pending: false, startedBy: "opus", turns: seed(), includes: [{ source: "decision-opinion:designcraft#1484:merge/o0", by: "mosswood", at: at(100), sent: false }] }],
   ]);
   let nextId = 100;
-  const open = (repo: string, n: number): Conversation => {
+  const open = (repo: string, n: number): Omit<Conversation, "canTalk" | "canWithdraw"> => {
     const k = `${repo}#${n}`;
     let c = store.get(k);
     if (!c) store.set(k, (c = { repo, number: n, exists: false, pending: false, startedBy: null, includes: [], turns: [] }));
@@ -211,7 +215,15 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
     return c;
   };
   const need = () => {
-    if (me.role !== "operator") throw new Error("only operators write in conversations");
+    if (me.role !== "operator") throw new Error("only operators share posts with Opus");
+  };
+  // The server's rule for talking to Opus: an operator, or a maintainer with write access (their turns run on their own Task Runner).
+  const talks = (repo: string) => me.role === "operator" || (me.role === "maintainer" && me.writeRepos.includes(repo));
+  // A maintainer's waiting message is withdrawn by an operator or its writer.
+  const waiting = (c: Omit<Conversation, "canTalk" | "canWithdraw">) => c.turns.find((t) => t.status === "pending" && t.kind === "maintainer");
+  const view = (c: Omit<Conversation, "canTalk" | "canWithdraw">): Conversation => {
+    const w = waiting(c);
+    return { ...c, canTalk: talks(c.repo), canWithdraw: !!w && (me.role === "operator" || w.login === me.login) };
   };
   // The server's rule for a card: an operator, or a maintainer with the setting on and write access (every mock repo uses the app's identity).
   const settles = (repo: string) => me.role === "operator" || (me.role === "maintainer" && me.maintainerWrites && me.writeRepos.includes(repo));
@@ -230,19 +242,20 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
           const d = derive?.(c.repo, c.number);
           if (d) choices.set(ref, d);
         }
-        return snap({ ...c, choices: choices.get(ref) ?? null, turns: c.turns.map((t) => ({ ...t, actions: t.actions.map((k) => ({ ...k, canSettle: settles(c.repo) })) })) });
+        return snap({ ...view(c), choices: choices.get(ref) ?? null, turns: c.turns.map((t) => ({ ...t, actions: t.actions.map((k) => ({ ...k, canSettle: settles(c.repo) })) })) });
       },
       async say(repo, n, text, ask) {
-        need();
+        if (!talks(repo)) throw new Error("only operators, and maintainers with write access to the repository, write in conversations");
+        const kind = me.role === "operator" ? "operator" : "maintainer";
         const c = open(repo, n);
         if (c.pending) throw new Error("Opus has not answered the last message yet");
         if (ask === false) {
-          c.turns.push({ id: nextId++, kind: "operator", login: me.login, at: new Date().toISOString(), body: text, actions: [], notes: [] });
+          c.turns.push({ id: nextId++, kind, login: me.login, at: new Date().toISOString(), body: text, actions: [], notes: [] });
           Object.assign(c, { exists: true, startedBy: c.startedBy ?? me.login });
           changed();
-          return snap(c);
+          return snap(view(c));
         }
-        const t: ConversationTurn = { id: nextId++, kind: "operator", login: me.login, at: new Date().toISOString(), body: text, actions: [], notes: [], status: "pending" };
+        const t: ConversationTurn = { id: nextId++, kind, login: me.login, at: new Date().toISOString(), body: text, actions: [], notes: [], status: "pending" };
         Object.assign(c, { exists: true, pending: true, startedBy: c.startedBy ?? me.login });
         c.turns.push(t);
         changed();
@@ -251,11 +264,21 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
           c.pending = false;
           // Like the server: Opus's reply carries a new set that replaces the current one.
           const cur = choices.get(`${repo}#${n}`);
-          if (cur) choices.set(`${repo}#${n}`, { ...(cur.decisionId.endsWith(":scope") ? scopeChoices(++epoch) : mergeChoices(++epoch)), pick: cur.pick && { core: cur.pick.core, reason: "Updated for your message." } });
+          if (cur) choices.set(`${repo}#${n}`, { ...(cur.decisionId.endsWith(":scope") ? scopeChoices(++epoch) : mergeChoices(++epoch)), pick: cur.pick && { core: cur.pick.core, reason: "Updated for your message." }, source: "conversation", after: me.login });
           c.turns.push({ id: nextId++, kind: "opus", login: "opus", at: new Date().toISOString(), body: "I read that. The pack and the committed files carry the same patterns, so asking the author to load the pack still holds.", actions: [], notes: [] });
           changed();
         }, 5000);
-        return snap(c);
+        return snap(view(c));
+      },
+      async withdraw(repo, n) {
+        const c = open(repo, n);
+        const w = waiting(c);
+        if (!w) throw new Error("no maintainer's message waits for Opus here");
+        if (me.role !== "operator" && w.login !== me.login) throw new Error("only an operator, or the person who wrote it, withdraws a message");
+        Object.assign(w, { status: "failed", error: `withdrawn by ${me.login}` });
+        c.pending = false;
+        changed();
+        return snap(view(c));
       },
       async include(repo, n, source, on) {
         need();
@@ -267,7 +290,7 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
           c.includes.splice(i, 1);
         }
         changed();
-        return snap(c);
+        return snap(view(c));
       },
       async cancelPreapproval(repo, number) {
         need();
@@ -291,7 +314,7 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
       async editCard(id, edit) {
         const k = find(id);
         needCard(k);
-        if (edit.instructions !== undefined && me.role !== "operator") throw new Error("only operators edit a fix-up's instructions");
+        if (edit.instructions !== undefined && me.role === "viewer") throw new Error("only operators edit a fix-up's instructions");
         if (edit.text !== undefined) k.text = edit.text;
         if (edit.issue && k.issue) Object.assign(k.issue, edit.issue);
         if (edit.instructions !== undefined && k.fixup) k.fixup.instructions = edit.instructions;
@@ -329,7 +352,7 @@ export function createConversationMock(me: User, changed: () => void, settle?: (
         const core = ch.cores.find((c) => c.key === body.core);
         if (!core) throw new Error(`no core ${body.core}`);
         if (body.note && body.note.length > 500) throw new Error("the note is longer than 500 characters");
-        if (body.params?.instructions !== undefined && me.role !== "operator") throw new Error("only operators edit a fix-up's instructions");
+        if (body.params?.instructions !== undefined && me.role === "viewer") throw new Error("only operators edit a fix-up's instructions");
         ch.run = { cardId: nextId, state: "running" };
         changed();
         await new Promise((r) => setTimeout(r, 1500));

@@ -4,8 +4,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { allocation } from "../src/agents/call.ts";
-import { askClaude } from "../src/classify/run.ts";
+import { allocation, WaitLimitError } from "../src/agents/call.ts";
+import { askClaude, setWorkspace } from "../src/classify/run.ts";
+import type { Lint } from "../src/replylint.ts";
 import { handleMcp, type McpEnv } from "../src/dash/mcp/index.ts";
 import { noteLine } from "../src/github/note.ts";
 import { createToken } from "../src/dash/mcp/tokens.ts";
@@ -293,6 +294,34 @@ describe("user-local remote calls", async () => {
     await db.run(db.k.deleteFrom("remote_liveness"));
     await done(a.lease!.secret, "after the outage");
     assert.equal((await ask)?.text, "after the outage");
+  });
+
+  test("a call bound to a maintainer waits only firstWaitMs for their runner; its fix turn on the session waits past that and keeps the first reply", async () => {
+    const restore = setWorkspace(async () => []);
+    const checkout = join(SCRATCH, "checkouts", "photocraft", "c".repeat(40));
+    mkdirSync(checkout, { recursive: true });
+    const lint: Lint = (text, stage) => (stage === "first" && text.includes("leaky") ? [{ field: "public.points[0]", message: "mentions the reference folder", text: "a leaky point" }] : []);
+    const reply = (secret: string, text: string) => submitCall(db, secret, { ok: true, text, model: "claude-opus-4-5", usage: { inputTokens: 10, outputTokens: 5 }, sessionId: "s1", durationMs: 10 });
+    const wait = 100;
+    const opts = { checkout, lint, itemTools: null, forLogin: "alice", firstWaitMs: wait };
+    try {
+      await assert.rejects(askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db, opts), WaitLimitError, "no runner took the first call in time");
+      const ask = askClaude("review.opus", "opus", SAMPLE_OPUS_PRS, db, opts);
+      const first = (await leaseFor("alice"))!;
+      await reply(first.secret, JSON.stringify({ verdict: "take", summary: "s", why: "w", public: { summary: "ok", points: ["a leaky point", "second"] } }));
+      // The fix turn on the session waits longer than the first call could.
+      let fix: { id: number; secret: string } | null = null;
+      for (let i = 0; i < 100 && !fix; i++) {
+        await sleep(wait / 2);
+        const queued = await db.get(db.k.selectFrom("remote_calls").select(["since"]).where("parent_id", "=", first.id).where("state", "=", "queued"));
+        if (queued && Date.now() - Number(queued.since) > wait * 2) fix = (await claimCall(db, callers.alice!, { ...claim(), sessions: [first.id] }, canWrite)).lease;
+      }
+      assert.ok(fix, "the fix turn was still queued past firstWaitMs");
+      await reply(fix.secret, JSON.stringify({ "public.points[0]": "clean point" }));
+      assert.deepEqual(JSON.parse((await ask)!.text).public.points, ["clean point", "second"]);
+    } finally {
+      restore();
+    }
   });
 
   test("a failed reply sends the call back to the queue with its next attempt, for another user's helper; the old secret answers 410", async () => {

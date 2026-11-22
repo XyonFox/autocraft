@@ -65,6 +65,11 @@ describe("runner", () => {
     assert.ok(j.log!.includes("token in the log: [hidden]"), j.log!);
     assert.ok(!j.log!.includes(FAKE_TOKEN));
     assert.equal((await getJob(db, bad.id)).error, "echo failed on purpose");
+    // The runner stored the log too: without the file (another disk) the job page shows the same scrubbed text.
+    await until(async () => !!await db.get(db.k.selectFrom("job_log_chunks").select("seq").where("job_id", "=", ok.id)));
+    rmSync((await db.get(db.k.selectFrom("jobs").select("log_path").where("id", "=", ok.id)))!.log_path!);
+    const stored = (await jobDetail(db, ok.id)).log!;
+    assert.ok(stored.includes("token in the log: [hidden]") && !stored.includes(FAKE_TOKEN), stored);
   });
 
   test("with AUTOCRAFT_DB_URL set, a job process opens that Postgres database, not a SQLite file", async () => {

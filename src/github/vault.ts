@@ -14,6 +14,7 @@ import { envVar } from "../env.ts";
 import { TokenBox } from "../dash/server/crypto.ts";
 import { resealLegacyValues } from "../dash/server/reseal.ts";
 import { readSecrets } from "../dash/server/config.ts";
+import { openAppKeys } from "./app-keys.ts";
 import { GitHubProvider, RevokeRefused, type Provider, type Tokens } from "../dash/server/provider.ts";
 import { failUserTokens, readUserTokens, revocationAad, shareRefresh, swapUserTokens } from "../dash/server/user-tokens.ts";
 import type { Db } from "../db/index.ts";
@@ -163,12 +164,17 @@ export class Vault {
   }
 }
 
-/** The runner's vault: the app's client credentials and the session key from the secrets file, as the dashboard reads them. Null without the GitHub App secrets. */
+/** The runner's vault: the app's client credentials from the process's app-key store and the session key from the secrets file, as the dashboard reads them. Null without a registered app. */
 export async function openVault(db: Db, env: NodeJS.ProcessEnv = process.env): Promise<Vault | null> {
   const secrets = readSecrets(envVar("SECRETS_FILE", env));
-  if (!secrets.app) return null;
+  const keys = await openAppKeys(db, env);
+  const app = keys?.current() ?? null;
+  if (!keys || !app) return null;
   const box = new TokenBox(secrets.sessionKey);
   // The runner may start before the dashboard has re-sealed values under the current key.
   await resealLegacyValues(db, box);
-  return new Vault(db, box, new GitHubProvider(secrets.app.clientId, secrets.app.clientSecret));
+  return new Vault(db, box, () => {
+    const now = keys.current() ?? app;
+    return new GitHubProvider(now.clientId, now.clientSecret);
+  });
 }

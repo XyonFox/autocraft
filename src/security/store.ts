@@ -28,7 +28,7 @@ export async function toScan(db: Db, r: ScanRow): Promise<ScanView> {
   const n = (await db.get(db.k.selectFrom("security_findings").select((eb) => eb.fn.countAll<number>().as("n")).where("scan_id", "=", r.id).where("state", "not in", INTERNAL_FINDING_STATES)))!.n;
   return {
     id: r.id, repo: r.repo, commit: r.commit_sha, state: r.state, capUsd: r.cap_usd, costUsd: r.cost_usd, estimateUsd: r.estimate_usd,
-    areasTotal: r.areas_total, areasDone: r.areas_done, findingCount: n, startedBy: r.started_by, startedAt: r.started_at, endedAt: r.ended_at, error: r.error,
+    areasTotal: r.areas_total, areasDone: r.areas_done, findingCount: n, startedBy: r.started_by, startedAt: r.started_at, endedAt: r.ended_at, error: r.error, canAct: false, canContinue: false,
   };
 }
 
@@ -138,7 +138,7 @@ export async function overview(db: Db, repo: string): Promise<SecurityOverview> 
   await reconcileFindings(db, repo);
   const scanList = await mapSeq(await db.all(scans(db).where("repo", "=", repo).orderBy("id", "desc").limit(20)), async (r) => await toScan(db, r));
   const listed = (await db.all(findings(db).where("repo", "=", repo).where("state", "not in", INTERNAL_FINDING_STATES).orderBy(severityOrder).orderBy("number").limit(500))).map(summary);
-  return { scans: scanList, findings: await withScanTests(db, listed) };
+  return { canStart: false, scans: scanList, findings: await withScanTests(db, listed) };
 }
 
 export const findingRow = async (db: Db, repo: string, n: number): Promise<FindingRow | undefined> =>

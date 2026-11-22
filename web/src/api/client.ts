@@ -165,12 +165,12 @@ export interface Api {
     keepAnswer(id: string): Promise<Decision>;
     /** Clears a Backlog answer so the decision is open again; null for a Backlog press on an item with no question, which is deleted. */
     reopen(id: string): Promise<Decision | null>;
-    /** Operator: snooze (`on`) or wake an open decision. */
+    /** Operator, or maintainer with write on the repo: snooze (`on`) or wake an open decision. */
     snooze(id: string, on: boolean): Promise<Decision>;
     /** The feedback box: an optional pick (replaces the user's live one) and free text, at least one. Text alone joins the thread. */
     feedback(id: string, input: { option?: string | null; text?: string }): Promise<Decision>;
     retract(id: string): Promise<Decision>;
-    /** Operator: has Opus prepare the open decision again in the choices format; the current choices stay until replaced. */
+    /** Operator, or maintainer with write on the repo: has Opus prepare the open decision again in the choices format; the current choices stay until replaced. */
     reprepare(id: string): Promise<Decision>;
     /** Operator only: answer with the opinion's option. */
     adopt(id: string, opinionId: string, textsHash?: string): Promise<Decision>;
@@ -184,6 +184,8 @@ export interface Api {
     say(repo: RepoName, number: number, text: string, ask?: boolean): Promise<Conversation>;
     /** Includes (`on`) or excludes a maintainer post for Opus. Removing an include that was already sent is refused. */
     include(repo: RepoName, number: number, source: string, on: boolean): Promise<Conversation>;
+    /** Withdraws the maintainer's message that waits for Opus (Conversation.canWithdraw). */
+    withdraw(repo: RepoName, number: number): Promise<Conversation>;
     /** A proposed card's editable drafts: the comment `text`, the open-issue step's title and body, the fix-up step's instructions. Fields left out stay as they are. */
     editCard(id: number, edit: CardEdit): Promise<ConversationCard>;
     /** `skip`: indexes into `steps` the operator removed; the rest run in order. `note`: kept with the choice (on the decision it settles, in the thread), never posted to GitHub; at most 500 characters. */
@@ -194,12 +196,12 @@ export interface Api {
     keepCard(id: number): Promise<ConversationCard>;
     /** Runs one core with its ticked extras as a card; returns that card. */
     doChoice(choiceId: string, body: DoChoiceBody): Promise<ConversationCard>;
-    /** Operator only: stops the item's running pre-approved merge (state becomes "cancelled"); the PR's open question, if any, stays. */
+    /** Operator or maintainer with write: stops the item's running pre-approved merge (state becomes "cancelled"); the PR's open question, if any, stays. */
     cancelPreapproval(repo: RepoName, number: number): Promise<Preapproval>;
-    /** Operator only: queues the failed pre-approved merge again with the same instructions at the PR's current head (a new pre-approval). */
+    /** Operator or maintainer with write: queues the failed pre-approved merge again with the same instructions at the PR's current head (a new pre-approval). */
     retryPreapproval(repo: RepoName, number: number): Promise<Preapproval>;
   };
-  /** A repo's area list. Reading is for everyone who sees the repo; every write is operator only. */
+  /** A repo's area list. Reading is for everyone who sees the repo; every write is for whoever runs the repo (operator, or maintainer with write). */
   areas: {
     get(repo: RepoName): Promise<RepoAreas>;
     /** Each edit saves a new list version and returns the repo's areas. Adding or removing an area also queues a re-scan. */
@@ -226,9 +228,9 @@ export interface Api {
   itemTraceDetail(repo: RepoName, number: number, id: string): Promise<ItemTraceDetail>;
   /** Every item's trace events in one stream, newest first; `since` as for `itemTrace`. */
   activity(q?: ActivityQuery): Promise<ActivityPage | ItemTraceUnchanged>;
-  /** Operator only: review the current head again, plan Verify again, or try the issue fix again. Writes nothing to GitHub. */
+  /** Operator or maintainer with write: review the current head again, plan Verify again, or try the issue fix again. Writes nothing to GitHub. */
   release(repo: RepoName, number: number, action: ReleaseAction): Promise<void>;
-  /** Operator only: puts an issue with a stopped fix in the Backlog or closes it (through a scope decision answered at once). */
+  /** Operator or maintainer with write: puts an issue with a stopped fix in the Backlog or closes it (through a scope decision answered at once). */
   stopFix(repo: RepoName, number: number, answer: "backlog" | "close"): Promise<void>;
   /** Someone who settles on the repo puts the open item on the Backlog: answers its open question with Backlog, or holds it with an answered `backlog` decision. */
   backlogItem(repo: RepoName, number: number): Promise<Decision>;
@@ -288,7 +290,7 @@ export interface Api {
     approvePushing(name: RepoName, approved: boolean): Promise<TrackedRepo>;
     /** Lets the Act step comment on and close items here, or stops it. */
     approveCommenting(name: RepoName, approved: boolean): Promise<TrackedRepo>;
-    /** Lets the Fix issues step push fixes, open pull requests and comment on issues here, or stops it. */
+    /** Lets the Implement step push implementations, open pull requests and comment on issues here, or stops it. */
     approveFixing(name: RepoName, approved: boolean): Promise<TrackedRepo>;
     /** Lets the Fix red main step rerun failed jobs on a red default branch here and open an issue on an operator's answer, or stops it. */
     approveMainFixing(name: RepoName, approved: boolean): Promise<TrackedRepo>;
@@ -384,7 +386,7 @@ export interface Api {
   /** A repo's issues with a stopped fix, 25 per page. */
   needsFixes(repo: RepoName, cursor?: string): Promise<NeedsFixPage>;
   needsOutside(author: string): Promise<NeedsOutsideList>;
-  /** Operator: exempts one item held for its author's daily limit or a surge. */
+  /** Operator or maintainer with write (one item; Release all is the operator's): exempts one item held for its author's daily limit or a surge. */
   releaseOutside(repo: RepoName, number: number): Promise<void>;
   /** Integration batches of the merge queue, newest first, with their member PRs. */
   queueBatches(filter: BatchFilter): Promise<BatchList>;

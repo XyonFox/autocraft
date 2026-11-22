@@ -296,7 +296,7 @@ function EnvsPanel() {
 
 const FEATURE_LABEL: Record<BuildFeatureName, string> = {
   screenshots: "Screenshots", "push-tests": "Tests before push", "batch-build": "Build batches",
-  "scan-tests": "Run scan tests", nightly: "Nightly checks", "pr-builds": "Build pull requests",
+  "scan-tests": "Run scan tests", nightly: "Nightly checks", "pr-builds": "Build pull requests", implement: "Implement queued issues",
 };
 
 function FeatureState({ on, label, operator, busy, onChange }: { on: boolean; label: string; operator: boolean; busy: boolean; onChange: (on: boolean) => void }) {
@@ -304,7 +304,7 @@ function FeatureState({ on, label, operator, busy, onChange }: { on: boolean; la
 }
 
 /** Per-repo screenshot commands as JSON. The setup is stored whether or not the switch is on; editing waits for the switch. */
-function ScreenshotSetupBlock({ repos, enabled, operator }: { repos: string[]; enabled: boolean; operator: boolean }) {
+function ScreenshotSetupBlock({ repos, enabled }: { repos: string[]; enabled: boolean }) {
   const api = useApi();
   const q = useQuery<ScreenshotSetups>("screenshot-setup", (a) => a.screenshotSetup.list());
   const write = useWrite();
@@ -324,7 +324,8 @@ function ScreenshotSetupBlock({ repos, enabled, operator }: { repos: string[]; e
     }
   }
   if (!repo) return null;
-  const off = !enabled || !operator;
+  const canEdit = !!q.data?.manageable.includes(repo);
+  const off = !enabled || !canEdit;
   const save = () => parsed && void write.run("save", () => api.screenshotSetup.put(repo, parsed!)).then((ok) => ok && (setDraft(null), q.refetch()));
   const remove = () => void write.run("remove", () => api.screenshotSetup.remove(repo)).then((ok) => ok && (setDraft(null), q.refetch()));
   return (
@@ -347,7 +348,7 @@ function ScreenshotSetupBlock({ repos, enabled, operator }: { repos: string[]; e
         className="font-mono text-xs"
       />
       <ErrorLine error={parseError ?? write.error ?? q.error?.message} />
-      {operator && (
+      {canEdit && (
         <div className="flex gap-2">
           <Button size="sm" variant="primary" disabled={off || !parsed || text === storedText} loading={write.busy === "save"} onClick={save} className="max-md:h-11">Save</Button>
           {stored && <ConfirmButton label="Remove" confirmLabel="Confirm remove" loading={write.busy === "remove"} onConfirm={remove} className={off ? "pointer-events-none opacity-50" : undefined} />}
@@ -378,7 +379,7 @@ function FeaturesPanel() {
               <span className="min-w-0 flex-1 text-sm">{FEATURE_LABEL[f.feature]}</span>
               <FeatureState on={f.on} label={FEATURE_LABEL[f.feature]} operator={operator} busy={write.busy === `${f.feature}:`} onChange={(on) => set(f.feature, on)} />
             </div>
-            {f.feature === "screenshots" && <ScreenshotSetupBlock repos={q.data?.repos ?? []} enabled={f.on} operator={operator} />}
+            {f.feature === "screenshots" && <ScreenshotSetupBlock repos={q.data?.repos ?? []} enabled={f.on} />}
             {f.repoScoped && f.on && (
               <ul className="mb-1 flex flex-wrap gap-x-5 pl-3">
                 {q.data!.repos.map((r) => (
@@ -557,7 +558,6 @@ function DetailBody({ id }: { id: number }) {
   const write = useWrite();
   const q = useQuery<BuildTaskDetail>(`task-${id}`, (a) => a.tasks.get(id));
   useNow(q.data && ACTIVE.includes(q.data.state) ? 1000 : undefined);
-  const operator = useUser().role === "operator";
   const t = q.data;
   if (!t) return <div className="p-4">{q.error ? <ErrorLine error={q.error.message} /> : <span className="text-sm text-ink/50">Loading.</span>}</div>;
   const active = ACTIVE.includes(t.state);
@@ -567,7 +567,7 @@ function DetailBody({ id }: { id: number }) {
         <Badge tone={STATE_TONE[t.state]}>{STATE_LABEL[t.state]}</Badge>
         {t.cancelRequested && active && <Badge tone="warn">Cancel requested</Badge>}
         <span className="code text-sm font-medium">{t.step}</span>
-        {operator && active && !t.cancelRequested && (
+        {t.canCancel && active && !t.cancelRequested && (
           <ConfirmButton label="Cancel task" confirmLabel="Cancel it" loading={write.busy === "cancel"} className="ml-auto" onConfirm={() => void write.run("cancel", () => api.tasks.cancel(t.id))} />
         )}
       </div>

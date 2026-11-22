@@ -16,6 +16,8 @@ import { NO_CI_SAMPLE, NO_CI_SQL, noCiFrom } from "./merge/no-ci.ts";
 import { fixupEditable } from "./fixup/patch.ts";
 import { SLUGS_KEY, namesOf, parseSlugs } from "./github/slugs.ts";
 import { SIM_THRESHOLD } from "./dupes/scan.ts";
+import { splitStageTripsSqlite } from "./db/trip-split.ts";
+import { retireFixAttemptsSqlite } from "./db/fix-retire.ts";
 
 export const DEFAULT_DB = join(homedir(), ".local/share/autocraft/mirror.db");
 
@@ -276,12 +278,31 @@ export const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
   ["remote_calls", "bundle_hash", "TEXT"],
   // When the caller read the done reply; a done call not yet read can still be adopted.
   ["remote_calls", "consumed_at", "INTEGER"],
+  // A session's workspace tools: the call bound to the workspace, and the lease run a relayed call came from (src/build/workspace-relay.ts).
+  ["workspaces", "remote_call_id", "INTEGER"],
+  ["workspace_calls", "run_id", "INTEGER"],
+  // Workspace resumes (src/build/workspace-launch.ts) and the prompt a lease rewrote for one (src/build/workspace-call.ts).
+  ["workspaces", "volume_fresh", "INTEGER NOT NULL DEFAULT 0"],
+  ["workspaces", "resume_tries", "INTEGER NOT NULL DEFAULT 0"],
+  ["workspaces", "checkpoint_error", "TEXT"],
+  ["workspaces", "restored", "TEXT"],
+  ["workspaces", "restored_at", "TEXT"],
+  ["remote_calls", "base_stdin", "TEXT"],
+  // A call only this user's own Task Runners take: a maintainer's conversation turn runs on their own inference.
+  ["remote_calls", "for_login", "TEXT COLLATE NOCASE"],
+  // 1 while the lease runs on the Task Runner's own lane (Claim.ownLane), beside its slots.
+  ["remote_calls", "own_lane", "INTEGER NOT NULL DEFAULT 0"],
+  // 1 for a bound call that runs in one of its user's Task Runner slots, never in the own lane (NewCall.boundSlot).
+  ["remote_calls", "bound_slot", "INTEGER NOT NULL DEFAULT 0"],
+  // The login whose conversation message the reply that wrote the choices answered.
+  ["decision_choices", "asked_by", "TEXT"],
 ];
 
 // Indexes on added columns: they can only be created once the column exists.
 // Covering indexes on the hash columns let the planner compare stored hashes without reading item rows.
 // The trigger clears the hashes of an item whose hashed fields were edited without bringing its own (sync does).
 export const ADDED_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS main.workspaces_call ON workspaces(remote_call_id) WHERE remote_call_id IS NOT NULL",
   // Covers the claims' read of the queued remote calls (src/remote/calls.ts queuedCalls) and the room count, so neither walks the overflow pages of each row's bundle.
   // remote_calls_queued, the same index without the pick columns, stays while the previous release may still read it
   // (INDEXED BY) during a rollout: the deploy migrates the database before the old processes restart. The next release drops it.
@@ -291,6 +312,8 @@ export const ADDED_INDEXES = [
   // lease, lease expiry), so none walks the overflow pages of each row's bundle. Those reads name it (INDEXED BY): without
   // statistics the planner takes the (state, ...) indexes, which do not cover them.
   "CREATE INDEX IF NOT EXISTS main.remote_calls_leased ON remote_calls(token_id, claim_id, user_login, heartbeat_at, leased_at, started_at, timeout_ms) WHERE state = 'leased'",
+  // Own-lane leases (a maintainer's own conversation turn on a Task Runner's own lane), which count toward no slot or Max calls at once: the reads above subtract them.
+  "CREATE INDEX IF NOT EXISTS main.remote_calls_leased_own ON remote_calls(user_login, token_id) WHERE state = 'leased' AND own_lane = 1",
   // One live card per set of choices: a double press cannot run the same choice twice.
   "CREATE UNIQUE INDEX IF NOT EXISTS main.conversation_cards_choice_live ON conversation_cards(choice_id) WHERE choice_id IS NOT NULL AND state IN ('proposed', 'running', 'done')",
   // Records the answerer's role when an answer is written (any writer); cleared with the answerer by an undo.
@@ -329,7 +352,7 @@ export const HISTORY_COPY_SQL = `INSERT INTO main.opus_review_history (repo, num
   WHERE NOT EXISTS (SELECT 1 FROM main.opus_review_history h WHERE h.repo = o.repo AND h.number = o.number AND h.head_oid = o.head_oid AND h.at = o.at)`;
 
 // Bump when migrateValues() or backfill() change what they do.
-const MIGRATION_VERSION = 18;
+const MIGRATION_VERSION = 20;
 
 // Rows written before their column existed.
 function backfill(db: DatabaseSync): void {
@@ -370,6 +393,7 @@ function backfill(db: DatabaseSync): void {
     db.exec("INSERT OR IGNORE INTO main.settings (key, value) VALUES ('review_base_backfilled', '1')");
   }
   splitRunnerTokens(db);
+  retireFixAttemptsSqlite(db);
   // Reviews made before snapshots existed count as having read everything up to now: no wave of re-reviews.
   const now = new Date().toISOString();
   db.prepare("UPDATE main.opus_reviews SET seen_at = ? WHERE seen_at IS NULL").run(now);
@@ -570,6 +594,8 @@ function migrateValues(db: DatabaseSync): void {
   db.exec("DROP TABLE IF EXISTS main.repo_directions; DROP TABLE IF EXISTS main.direction_proposals");
   db.prepare("DELETE FROM main.settings WHERE key = 'direction_proposals_since'").run();
   if (!db.prepare("SELECT 1 FROM main.settings WHERE key = 'ci_first_done'").get()) ciFirst(db);
+  // Once: breaker rows of a whole push stage are split into one row per repo.
+  splitStageTripsSqlite(db);
   // Jev usage saved without a cost is priced from its input tokens.
   const JEV_UNPRICED = "model LIKE 'jev%' AND cost_usd IS NULL AND input_tokens IS NOT NULL";
   if (db.prepare(`SELECT 1 FROM main.token_usage WHERE ${JEV_UNPRICED} LIMIT 1`).get()) {

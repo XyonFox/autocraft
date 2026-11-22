@@ -21,7 +21,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export function OpusCard({ card: a, operator, viewer, editInstructions = true, onRun, onDismiss, onDispute, onKeep, className }: {
   card: ConversationCard;
   operator: boolean;
-  /** False: the fix-up instructions show without an Edit button (they go to the fix-up model, so only operators write them). */
+  /** False: the fix-up instructions show without an Edit button (they go to the fix-up model, so only people who run the repo write them). */
   editInstructions?: boolean;
   /** Runs the card; `edit` holds the drafts (comment text, issue, fix-up instructions) that differ from the proposed ones. */
   onRun: (edit?: CardEdit) => Promise<unknown>;
@@ -182,7 +182,7 @@ export function OpusCard({ card: a, operator, viewer, editInstructions = true, o
       {a.state === "queued" && a.queued && viewer && onDispute && onKeep && (
         <QueuedPress by={a.by ?? ""} queued={a.queued} viewer={{ login: viewer.login, operator }} canSettle={a.canSettle} onDismiss={onDismiss} onDispute={onDispute} onKeep={onKeep} />
       )}
-      {proposed && operator && (
+      {proposed && a.canSettle && (
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
           <Button
             size="sm"

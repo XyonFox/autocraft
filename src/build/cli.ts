@@ -1,5 +1,5 @@
 // autocraft-server envs list | add | set | rotate-key, autocraft-server tasks list | show | cancel | enqueue-test,
-// autocraft-server workspace start | list | show | run | end (the operator's tools for workspace pods)
+// autocraft-server workspace start | list | show | run | tool | try | end (the operator's tools for workspace pods)
 // Recorded as `cli`: only someone with a shell on the host can run these. Worker keys go to a
 // file (mode 0600) and are printed only with --print. Text a worker sent is shown with control
 // characters removed, so it cannot drive the terminal.
@@ -13,7 +13,10 @@ import type { Db } from "../db/index.ts";
 import { openDb } from "../db/open.ts";
 import { inClusterApi } from "./kube-api.ts";
 import { FETCH_SCRIPT } from "../worker/rust.ts";
-import { createWorkspace, describeHeader, endWorkspace, execWs, getWorkspace, LIVE_STATES, WORKSPACE_COLUMNS, type WorkspaceRow, type WsHeader } from "./workspaces.ts";
+import { WorkspaceSession } from "./workspace-tools.ts";
+import { requestTrySession, TRY_DEADLINE_SEC, TRY_PROMPT_MAX_BYTES, TRY_STEP } from "./workspace-session.ts";
+import { CLI_QUEUE_BY, enqueue, JobError } from "../runner/jobs.ts";
+import { capJson, createWorkspace, describeHeader, endWorkspace, execWs, getWorkspace, LIVE_STATES, WORKSPACE_COLUMNS, type WorkspaceRow, type WsHeader } from "./workspaces.ts";
 
 const USAGE = `usage: autocraft-server envs list
        autocraft-server envs add <id> --label TEXT --kind local-sandbox|remote --slots N [--confidential yes|no] (--out FILE | --print)
@@ -34,6 +37,9 @@ const USAGE = `usage: autocraft-server envs list
        autocraft-server workspace list [--all]
        autocraft-server workspace show <id>
        autocraft-server workspace run <id> -- <command...>     (in the runner container: needs pods/exec)
+       autocraft-server workspace tool <id> <tool> '<json args>'  (a session tool call, as a session makes it; same container)
+       autocraft-server workspace try <repo> <sha> --item N --prompt TEXT [--workspace ID] [--env ID] [--keep] [--deadline-sec N]
+         (queues a test session job; its log has the result)
        autocraft-server workspace end <id>`;
 
 function die(msg: string): never {
@@ -287,17 +293,20 @@ async function workspace(args: string[]): Promise<void> {
   };
   const line = (w: WorkspaceRow) =>
     `${String(w.id).padStart(5)} ${w.state.padEnd(9)} ${safe(w.repo).padEnd(16)} ${w.base_sha.slice(0, 8)} ${w.env_id.padEnd(12)} ${(w.node ?? "-").padEnd(14)} ${w.created_at.slice(0, 16)} ${safe(w.owner)}`;
+  /** --env, or the one enabled kubernetes environment. */
+  const envOf = async (opt: Map<string, string>): Promise<string> => {
+    const given = opt.get("env");
+    if (given) return given;
+    const k = (await listEnvs(db)).filter((e) => e.kind === "kubernetes" && e.enabled);
+    if (k.length !== 1) die(`give --env: ${k.length ? `${k.length} kubernetes environments are enabled` : "no kubernetes environment is enabled"}`);
+    return k[0]!.id;
+  };
   if (sub === "start") {
     const { pos, opt } = options(rest);
     const [repo, sha] = pos;
     if (!repo || !sha) die(USAGE);
     if (!(await trackedNames(db)).includes(repo)) die(`${repo} is not a tracked repo`);
-    let envId = opt.get("env");
-    if (!envId) {
-      const k = (await listEnvs(db)).filter((e) => e.kind === "kubernetes" && e.enabled);
-      if (k.length !== 1) die(`give --env: ${k.length ? `${k.length} kubernetes environments are enabled` : "no kubernetes environment is enabled"}`);
-      envId = k[0]!.id;
-    }
+    const envId = await envOf(opt);
     const deadline = opt.has("deadline-sec") ? Number(opt.get("deadline-sec")) : undefined;
     const id = await run(async () => await createWorkspace(db, { repo, baseSha: sha, envId, app: opt.get("app") ?? null, ...(deadline !== undefined && { limits: { deadlineSec: deadline } }), owner: "cli" }));
     console.log(`workspace ${id} requested on ${envId}`);
@@ -318,8 +327,8 @@ async function workspace(args: string[]): Promise<void> {
     for (const c of calls.reverse()) {
       let summary = "";
       try {
-        const r = JSON.parse(c.result ?? "{}") as { header?: WsHeader | null; error?: string };
-        summary = r.error ?? describeHeader(r.header ?? null);
+        const r = JSON.parse(c.result ?? "{}") as { header?: WsHeader | null; error?: string; text?: string };
+        summary = r.error ?? (typeof r.text === "string" ? r.text.split("\n", 1)[0]!.slice(0, 120) : describeHeader(r.header ?? null));
       } catch { /* not JSON */ }
       console.log(`  call ${c.id}${c.n !== null ? ` (ws ${c.n})` : ""} ${safe(c.tool)} ${c.state} ${c.created_at.slice(11, 19)}  ${safe(summary)}`);
     }
@@ -334,6 +343,49 @@ async function workspace(args: string[]): Promise<void> {
     if (r.output) process.stdout.write(r.output.endsWith("\n") ? r.output : `${r.output}\n`);
     if (r.stderr) process.stderr.write(r.stderr);
     if (r.error) console.error(`exec: ${r.error}`);
+  } else if (sub === "tool") {
+    const id = idOf(rest[0]);
+    const name = rest[1] ?? die(USAGE);
+    let args: unknown;
+    try {
+      args = JSON.parse(rest[2] ?? "{}");
+    } catch {
+      die("the arguments must be JSON");
+    }
+    if (!await getWorkspace(db, id)) die("no such workspace");
+    const api = inClusterApi() ?? die("this shell is not in the cluster: run it in the runner container, whose service account may exec in workspace pods");
+    const at = new Date().toISOString();
+    const row = Number((await db.get(db.k.insertInto("workspace_calls").values({ workspace_id: id, tool: name, args: JSON.stringify(capJson(args)), state: "queued", created_at: at }).returning("id")))!.id);
+    const r = await new WorkspaceSession(db, api, id).call(name, args, row);
+    console.log(`call ${row}${r.isError ? " (error)" : ""}`);
+    process.stdout.write(r.text.endsWith("\n") ? r.text : `${r.text}\n`);
+    for (const im of r.images ?? []) console.log(`[image ${im.mimeType}, ${Buffer.from(im.data, "base64").length} bytes]`);
+  } else if (sub === "try") {
+    const { pos, opt } = options(rest, ["keep"]);
+    const [repo, sha] = pos;
+    const item = Number(opt.get("item"));
+    const prompt = opt.get("prompt");
+    if (!repo || !sha || pos.length !== 2 || !prompt || !Number.isInteger(item)) die(USAGE);
+    const workspaceId = opt.has("workspace") ? idOf(opt.get("workspace")) : null;
+    const deadlineSec = opt.has("deadline-sec") ? Number(opt.get("deadline-sec")) : undefined;
+    if (deadlineSec !== undefined && !(Number.isInteger(deadlineSec) && deadlineSec >= TRY_DEADLINE_SEC.min && deadlineSec <= TRY_DEADLINE_SEC.max)) die(`--deadline-sec must be ${TRY_DEADLINE_SEC.min} to ${TRY_DEADLINE_SEC.max}`);
+    if (Buffer.byteLength(prompt, "utf8") > TRY_PROMPT_MAX_BYTES) die(`--prompt is at most ${TRY_PROMPT_MAX_BYTES} bytes`);
+    // A given workspace brings its own environment.
+    const envId = workspaceId === null ? await envOf(opt) : opt.get("env") ?? "";
+    const session = await run(async () => await requestTrySession(db, { repo, baseSha: sha, item, prompt, envId, keep: opt.has("keep"), ...(deadlineSec !== undefined && { deadlineSec }), workspaceId, by: "cli" }));
+    try {
+      // Queued, not run here: the runner runs the job, so a runner restart resumes it.
+      const job = await enqueue(db, TRY_STEP, { repo, session }, CLI_QUEUE_BY);
+      // Recorded now so the session sweep sees a job that ends before it starts; a job that already claimed it keeps it.
+      await db.run(db.k.updateTable("workspace_sessions").set({ job_id: job.id }).where("id", "=", session).where("job_id", "is", null));
+      console.log(`session ${session}: job ${job.id} queued; its log has the result`);
+    } catch (e) {
+      const why = (e as Error).message ?? String(e);
+      await db.run(db.k.updateTable("workspace_sessions").set({ state: "failed", outcome: `not queued: ${why}`.slice(0, 300), ended_at: new Date().toISOString() })
+        .where("id", "=", session).where("job_id", "is", null));
+      if (!(e instanceof JobError)) throw e;
+      die(`session ${session} not queued: ${why}`);
+    }
   } else if (sub === "end") {
     const id = idOf(rest[0]);
     console.log(await endWorkspace(db, id) ? `workspace ${id} ended; the launcher deletes its pod and volume` : `workspace ${id} is not live`);
@@ -343,5 +395,5 @@ async function workspace(args: string[]): Promise<void> {
 export const commands = {
   envs: { summary: "build environments: list | add <id> | set <id> | rotate-key <id>", run: async (args: string[]) => await envs(args) },
   tasks: { summary: "build tasks: list | show <id> | cancel <id> | mem | enqueue-test", run: async (args: string[]) => await tasks(args) },
-  workspace: { summary: "workspace pods: start <repo> <sha> | list | show <id> | run <id> -- <cmd> | end <id>", run: async (args: string[]) => await workspace(args) },
+  workspace: { summary: "workspace pods: start <repo> <sha> | list | show <id> | run <id> -- <cmd> | tool <id> <tool> <json> | try <repo> <sha> | end <id>", run: async (args: string[]) => await workspace(args) },
 };

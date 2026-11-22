@@ -54,7 +54,7 @@ export function createQueueMock(me: User, changed: () => void): Pick<Api, "pipel
   const stopped = new Set<number>();
   const key = (r: { repo: string; number: number }) => `${r.repo}#${r.number}`;
   const need = () => {
-    if (me.role !== "operator") throw new Error("not allowed");
+    if (me.role === "viewer") throw new Error("not allowed");
   };
   const pos = (r: { repo: string; number: number }): FastPosition | null => {
     const i = fast.indexOf(key(r));

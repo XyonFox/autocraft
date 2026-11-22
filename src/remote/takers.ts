@@ -5,12 +5,14 @@
 // no room. takerTest is the one taker rule: pools and the runner's job starts skip work without a taker, the
 // dashboard's minute maintenance runs sweepTakers: a queued call with no taker for NO_TAKER_MS is withdrawn, and pipeline-on
 // repos with no taker are recorded for the remote-no-taker health check. Follow-up turns and calls with a pick that counts
-// keep their own rules (calls.ts awaitCall, picks).
+// keep their own rules (calls.ts awaitCall, picks). A call bound to a user (a maintainer's conversation turn) has a taker only
+// in that user's runners.
 import { WRITE_PERMISSIONS } from "../dash/server/provider.ts";
 import { PERM_READ_TTL } from "../dash/server/sessions.ts";
-import { NO_TAKER_PREFIX, pickCounts, pickerLogins, queueSnapshot, runnerTakes, withdrawCall } from "./calls.ts";
+import { NO_TAKER_PREFIX, pickCounts, pickerLogins, queueSnapshot, roleFits, runnerTakes, withdrawCall } from "./calls.ts";
 import { STATUS_FRESH_MS } from "./helpers.ts";
-import { inferenceMode } from "./mode.ts";
+import { acceptedModels, familyOf, inferenceMode, isTier } from "./mode.ts";
+import type { Tier } from "./protocol.ts";
 import { claimRepos } from "./my-repos.ts";
 import { SKIP_TASKS_KEY, TASK_CHOICES, taskOfStep, userSkips } from "./my-tasks.ts";
 import { CALLER_STALE_MS, roomCanWrite } from "./room.ts";
@@ -30,7 +32,12 @@ export const NO_TAKER_MS = scaled(10 * 60_000);
  * `step`: the call's step, for the takers' tasks (my-tasks.ts); left out, the question is about repos alone. `someTask`: with no
  * step, only a runner whose user takes at least one task counts (with none ticked a user takes only picks).
  */
-export type TakerCall = { prompt_id: string; repos: readonly string[]; step?: string; someTask?: boolean; /** The call's items; left out, a question asked before they are known (task-items.ts). */ refs?: readonly ItemRef[]; /** Only runners whose user takes some items count. */ filtered?: boolean };
+export type TakerCall = {
+  prompt_id: string; repos: readonly string[]; step?: string; someTask?: boolean; /** The call's items; left out, a question asked before they are known (task-items.ts). */ refs?: readonly ItemRef[]; /** Only runners whose user takes some items count. */ filtered?: boolean;
+  /** A call bound to this user (calls.ts NewCall.forLogin): only their runners count, under the role rules and write permission alone, as for a pick, and only those that offer `tier`. */
+  forLogin?: string | null;
+  tier?: Tier;
+};
 
 /**
  * Whether some taker may take a call now, for many questions at one moment (a pool's round, the runner's pass over queued
@@ -75,17 +82,21 @@ export async function takerSignature(db: Db, nowMs: number = Date.now()): Promis
   return denied.at ? `${s}|${denied.at}` : s;
 }
 
-type Runner = { login: string; role: string; repos: ReadonlySet<string> | null; skip: ReadonlySet<string>; items: ItemFilter };
+type Runner = { login: string; role: string; repos: ReadonlySet<string> | null; skip: ReadonlySet<string>; items: ItemFilter; /** The tiers its models offer (accepted families). */ tiers: ReadonlySet<Tier> };
 
 /** The takers as the taker rule reads them. */
 async function readRunners(db: Db, nowMs: number): Promise<{ runners: Runner[]; canWrite: (login: string, repo: string) => boolean }> {
   const rows = await db.all(db.k.selectFrom("main.mcp_tokens as t").innerJoin("main.remote_helpers as h", "h.token_id", "t.id").innerJoin("main.access as a", "a.login", "t.login")
-    .select(["t.login", "a.role", "t.idle_repos"]).where((eb) => takerExpr(eb, nowMs)));
+    .select(["t.login", "a.role", "t.idle_repos", "h.models"]).where((eb) => takerExpr(eb, nowMs)));
   const canWrite = await roomCanWrite(db, rows.map((r) => r.login), nowMs);
+  const accepted = await acceptedModels(db);
   const runners = await mapSeq(rows, async (h) => {
     let own: string[] | undefined;
     try { own = h.idle_repos ? JSON.parse(h.idle_repos) as string[] : undefined; } catch { /* every repo */ }
-    return { login: h.login, role: h.role, repos: await claimRepos(db, h.login, own), skip: await userSkips(db, h.login), items: await itemFilter(db, h.login) };
+    let models: Record<string, unknown> = {};
+    try { models = JSON.parse(h.models) as Record<string, unknown>; } catch { /* no models */ }
+    const tiers = new Set(Object.entries(models).flatMap(([t, m]) => (isTier(t) && typeof m === "string" && familyOf(m, accepted[t]) !== null ? [t] : [])));
+    return { login: h.login, role: h.role, repos: await claimRepos(db, h.login, own), skip: await userSkips(db, h.login), items: await itemFilter(db, h.login), tiers };
   });
   return { runners, canWrite };
 }
@@ -93,7 +104,9 @@ async function readRunners(db: Db, nowMs: number): Promise<{ runners: Runner[]; 
 async function readTakers(db: Db, nowMs: number): Promise<(c: TakerCall) => boolean> {
   const { runners, canWrite } = await readRunners(db, nowMs);
   if (!runners.length) return () => false;
-  return (c) => runners.some((r) => !(c.someTask && r.skip.size >= TASK_CHOICES.length) && !(c.filtered && !r.items) && runnerTakes(r, c, canWrite));
+  return (c) => c.forLogin
+    ? runners.some((r) => r.login.toLowerCase() === c.forLogin!.toLowerCase() && (c.tier === undefined || r.tiers.has(c.tier)) && roleFits(r.role, c) && c.repos.every((x) => canWrite(r.login, x)))
+    : runners.some((r) => !(c.someTask && r.skip.size >= TASK_CHOICES.length) && !(c.filtered && !r.items) && runnerTakes(r, c, canWrite));
 }
 
 /** A key equal for two units exactly when the same users of `logins` take them under their item choices (task-items.ts); "" when none does. */
@@ -134,13 +147,33 @@ export const noTakerReason = (repos: readonly string[], step?: string, items?: r
   return `${NO_TAKER_PREFIX} ${items?.length ? `on its items (My tasks: ${items.map((x) => TASK_ITEMS_TITLE[x]).join(" or ")})` : task !== undefined ? `of the ${TASK_CHOICES.find((t) => t.id === task)?.title ?? task} task (My tasks)` : repos.length ? `on ${repos.join(", ")}` : "that name no repo"}`;
 };
 
-/** Why no taker takes a call `takes` says no to: its repos, else its task, else the item choices of the runners that take the rest. */
-async function whyNoTaker(db: Db, nowMs: number, takes: (c: TakerCall) => Promise<boolean>, c: { prompt_id: string; repos: readonly string[]; step: string }): Promise<string> {
+/** Whether one of `login`'s own Task Runners is a taker for a call bound to them (NewCall.forLogin) on `repos` now. */
+export async function ownTaker(db: Db, login: string, c: { prompt_id: string; repos: readonly string[]; tier: Tier }, nowMs: number = Date.now()): Promise<boolean> {
+  return await takerTest(db, nowMs)({ ...c, forLogin: login });
+}
+
+/** The error of a bound call withdrawn because none of its user's Task Runners is ready: its caller skips the work (NoTakerError). */
+export const noOwnRunnerReason = (login: string): string => `${NO_TAKER_PREFIX} for ${login}: none of their Task Runners is connected and ready`;
+
+/** Why no taker takes a call `takes` says no to: its user's runners for a bound call; else its repos, else its task, else the item choices of the runners that take the rest. */
+async function whyNoTaker(db: Db, nowMs: number, takes: (c: TakerCall) => Promise<boolean>, c: { prompt_id: string; repos: readonly string[]; step: string; forLogin?: string | null }): Promise<string> {
+  if (c.forLogin) return noOwnRunnerReason(c.forLogin);
   if (!await takes({ prompt_id: c.prompt_id, repos: c.repos })) return noTakerReason(c.repos);
   if (!await takes({ prompt_id: c.prompt_id, repos: c.repos, step: c.step })) return noTakerReason(c.repos, c.step);
   const { runners, canWrite } = await readRunners(db, nowMs);
   const choices = new Set(await mapSeq(runners.filter((r) => r.items && runnerTakes({ ...r, items: null }, { prompt_id: c.prompt_id, repos: c.repos, step: c.step }, canWrite)), async (r) => await userTaskItems(db, r.login)));
   return noTakerReason(c.repos, c.step, TASK_ITEMS.filter((x): x is Exclude<TaskItems, "all"> => x !== "all" && choices.has(x)));
+}
+
+/**
+ * Why no connected Task Runner may take a call of `step` on `repo` now, or null when one may (always null outside the user-local
+ * mode). For a request that would otherwise queue work nothing takes.
+ */
+export async function noTakerFor(db: Db, repo: string, step: string, nowMs: number = Date.now()): Promise<string | null> {
+  if (await inferenceMode(db) !== "user-local") return null;
+  const takes = takerTest(db, nowMs);
+  if (await takes({ prompt_id: "", repos: [repo], step })) return null;
+  return await whyNoTaker(db, nowMs, takes, { prompt_id: "", repos: [repo], step });
 }
 
 /**

@@ -15,6 +15,9 @@ export function canAct(user: User, repos: string[]): boolean {
   return user.role !== "viewer" && [...new Set(repos)].every((r) => user.writeRepos.includes(r));
 }
 
+/** Whether the user runs the repo (server rule: operator, or maintainer with write). */
+export const canRun = (user: User, repo: string): boolean => user.runRepos.includes(repo);
+
 export const repoPermission = (user: User, repo: string): "write" | "none" => (user.writeRepos.includes(repo) ? "write" : "none");
 
 export function roleLabel(user: User) {

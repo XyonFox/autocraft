@@ -154,7 +154,7 @@ export class Client {
   /** Runs gh without blocking the event loop (the runner's tick must keep its heartbeat and cancels). A timeout or spawn error is Transient. */
   private async run(query: string, variables: object, env: Record<string, string> | undefined): Promise<{ data?: Node; errors: Node[]; text: string; failed: boolean; stderr: string }> {
     const p = await new Promise<{ stdout: string; stderr: string; status: number | null }>((resolve, reject) => {
-      const child = spawn("gh", ["api", "graphql", "--input", "-"], { stdio: ["pipe", "pipe", "pipe"], ...(env ? { env } : {}) });
+      const child = spawn("gh", ["api", "graphql", "--input", "-"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, ...(env ? { env } : {}) });
       const out: Buffer[] = [];
       const err: Buffer[] = [];
       let size = 0;

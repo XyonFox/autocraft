@@ -70,10 +70,11 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
 
   const staff = me.role !== "viewer";
   const item = (repo: string, number: number, kind: "pr" | "issue", title: string) => ({ repo, number, kind, state: "open" as const, title });
-  type Row = Omit<ModelQueueCall, "pickable" | "picked"> & { pickedBy: string | null; repo: string };
+  type Row = Omit<ModelQueueCall, "pickable" | "picked"> & { pickedBy: string | null; repo: string; forLogin?: string };
   const queue: Row[] = [
     { id: 5101, repo: "photocraft", items: [item("photocraft", 10012, "pr", "Fix crash when the curves panel is closed while a preview renders")], kind: "Review pull requests", tier: "top", model: "opus", estCostUsd: 0.84, waitedMs: 11 * MIN, why: { code: "picked", text: `Picked by ${me.login}` }, pickedBy: me.login, gating: false, followUp: false },
     { id: 5102, repo: "designcraft", items: [item("designcraft", 1520, "pr", "Snap guides to the artboard edge on resize")], kind: "Review pull requests", tier: "top", model: "opus", estCostUsd: 0.79, waitedMs: 8 * MIN, why: { code: "picked", text: "Picked by oakmoss" }, pickedBy: "oakmoss", gating: false, followUp: false },
+    { id: 5108, repo: "designcraft", forLogin: "kiri-n", items: [item("designcraft", 1484, "pr", "Add Hungarian spellchecking and nonstandard hyphenation")], kind: "Answer conversations", tier: "top", model: "opus", estCostUsd: 0.38, waitedMs: 2 * MIN, why: staff ? { code: "bound", text: "Waiting for kiri-n's Task Runner: it is busy" } : { code: "bound", text: "Waiting for the asker's own Task Runner: it is busy" }, pickedBy: null, gating: false, followUp: false },
     { id: 5103, repo: "pdfcraft", items: [item("pdfcraft", 2210, "pr", "Keep form field order when flattening annotations")], kind: "Push fix-ups", tier: "mid", model: "sonnet", estCostUsd: 0.31, waitedMs: 6 * MIN, why: { code: "session", text: "Waiting for laptop, which holds its session" }, pickedBy: null, gating: false, followUp: true },
     { id: 5104, repo: "vectorcraft", items: [item("vectorcraft", 873, "issue", "Boolean union drops the last subpath of compound shapes"), item("vectorcraft", 880, "issue", "Union of overlapping circles leaves a sliver")], kind: "Ask decisions", tier: "top", model: "opus", estCostUsd: 0.42, waitedMs: 19 * MIN, why: { code: "manual-only", text: "Every ready Task Runner is Manual only" }, pickedBy: null, gating: false, followUp: false, lastError: "the harness exited with code 1: rate limited" },
     { id: 5105, repo: "filmcraft", items: [item("filmcraft", 3301, "pr", "Trim clips on the timeline with the keyboard")], kind: "Classify new and changed items", tier: "small", model: "haiku", estCostUsd: 0.004, waitedMs: 3 * MIN, why: { code: "busy", text: "Every Task Runner that may take it is busy" }, pickedBy: null, gating: true, followUp: false },
@@ -83,12 +84,12 @@ export function createMcpMock(me: User, changed: () => void): Pick<Api, "mcp" | 
   const pickMax = 3;
   const picks = () => queue.filter((r) => r.pickedBy === me.login).length;
   const view = (): ModelQueue => ({
-    calls: queue.map(({ pickedBy, repo, lastError, ...r }) => ({
+    calls: queue.map(({ pickedBy, repo, lastError, forLogin, ...r }) => ({
       ...structuredClone(r),
       ...(staff && lastError && { lastError }),
       why: r.why.code === "picked" && !staff ? { code: "picked" as const, text: "Picked by a user" } : r.why,
       picked: pickedBy ? (staff ? { login: pickedBy } : {}) : null,
-      pickable: staff && !pickedBy && !r.followUp && me.writeRepos.includes(repo) && picks() < pickMax,
+      pickable: staff && !pickedBy && !forLogin && !r.followUp && me.writeRepos.includes(repo) && picks() < pickMax,
     })),
     runners: { autopilot: 3, manual: 1, ...(staff && { manualLogins: ["oakmoss"] }) },
     me: { canPick: staff, manualOnly: settings.manualOnly, picks: picks(), pickMax },
